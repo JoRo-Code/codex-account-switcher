@@ -1,0 +1,781 @@
+#!/usr/bin/env python3
+"""Local ChatGPT account selection for Codex CLI. Python 3.9+, macOS/Linux."""
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import json
+import io
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+VERSION = '0.2.0'
+ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
+BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
+NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
+# Ambient credentials must never override the selected ChatGPT account.
+AUTH_ENV = ('OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN',
+            'OPENAI_IDENTITY_TOKEN_FILE', 'OPENAI_IDENTITY_PROVIDER_ID',
+            'OPENAI_BASE_URL', 'CHATGPT_BASE_URL', 'CODEX_REMOTE_TOKEN',
+            'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CODEX_APP_TOOLS_PIPE_PATH',
+            'CODEX_INTERNAL_ORIGINATOR_OVERRIDE')
+
+class Error(Exception):
+    pass
+
+def private_dir(path):
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.chmod(0o700)
+
+def atomic_json(path, value):
+    private_dir(path.parent)
+    fd, tmp = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(value, f, indent=2)
+            f.write('\n')
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+def read_json(path, default=None):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return default
+
+@contextlib.contextmanager
+def lock(name, shared=False):
+    private_dir(ROOT / 'locks')
+    with (ROOT / 'locks' / (name + '.lock')).open('a') as f:
+        try:
+            fcntl.flock(f, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Error('This account or conversation is busy. Close its active launcher session and retry.')
+        yield
+
+def account_home(name):
+    if not NAME.fullmatch(name):
+        raise Error('Account names must be 1–40 letters, digits, underscores or hyphens.')
+    return ROOT / 'accounts' / name
+
+def accounts():
+    base = ROOT / 'accounts'
+    return sorted(p.name for p in base.iterdir() if p.is_dir() and NAME.fullmatch(p.name)) if base.exists() else []
+
+def require_account(name):
+    home = account_home(name)
+    if name not in accounts():
+        raise Error('Unknown account. Connect it with: codex-accounts add ' + name)
+    return home
+
+def environment(name):
+    env = os.environ.copy()
+    for key in AUTH_ENV:
+        env.pop(key, None)
+    env['CODEX_HOME'] = str(require_account(name))
+    return env
+
+def command(*args):
+    if not shutil.which(BINARY):
+        raise Error('Codex CLI was not found on PATH. Install Codex first.')
+    return [BINARY, *args, '-c', 'cli_auth_credentials_store="file"',
+            '-c', 'forced_login_method="chatgpt"', '-c', 'model_provider="openai"']
+
+def owners():
+    return read_json(ROOT / 'owners.json', {})
+
+def session_records(account=None):
+    ownership = owners()
+    result = []
+    for name in ([account] if account else accounts()):
+        home = require_account(name)
+        for path in (home / 'sessions').rglob('*.jsonl'):
+            try:
+                with path.open() as f:
+                    line = f.readline(1024 * 1024)
+                meta = json.loads(line)
+                if meta.get('type') != 'session_meta':
+                    continue
+                meta = meta['payload']
+                sid = str(uuid.UUID(meta['id']))
+                if ownership.get(sid, name) != name:
+                    continue
+                result.append(dict(id=sid, account=name, cwd=meta.get('cwd', ''),
+                                   history_mode=meta.get('history_mode', 'legacy'),
+                                   title=session_title(path),
+                                   modified=path.stat().st_mtime, path=str(path)))
+            except (OSError, ValueError, KeyError):
+                continue
+    return sorted(result, key=lambda row: row['modified'], reverse=True)
+
+def session_title(path):
+    # Read only the beginning; never scan megabytes of tool output for a title.
+    with path.open() as f:
+        for line in f.read(262144).splitlines():
+            try:
+                item = json.loads(line)
+                payload = item.get('payload', {})
+                if item.get('type') == 'event_msg' and payload.get('type') == 'user_message':
+                    value = payload.get('message', '')
+                    if isinstance(value, str) and value.strip() and not value.lstrip().startswith('<'):
+                        return ' '.join(value.split())[:90]
+            except ValueError:
+                continue
+    return '(untitled)'
+
+def pick(rows, label, describe):
+    if not rows:
+        raise Error('No ' + label + ' found.')
+    if not sys.stdin.isatty():
+        raise Error('Specify a selection explicitly; the picker needs an interactive terminal.')
+    for i, row in enumerate(rows, 1):
+        print(f'{i:>3}. {describe(row)}')
+    value = input('Choose number (Enter to cancel): ').strip()
+    if not value:
+        raise Error('Cancelled.')
+    if not value.isdigit() or not 1 <= int(value) <= len(rows):
+        raise Error('Invalid selection.')
+    return rows[int(value) - 1]
+
+def choose_account(name=None):
+    if name:
+        require_account(name)
+        return name
+    names = accounts()
+    if not names:
+        raise Error('Connect your first account: codex-accounts add personal')
+    if len(names) == 1:
+        return names[0]
+    return pick(names, 'accounts', lambda n: n)
+
+def describe_session(row):
+    when = dt.datetime.fromtimestamp(row['modified']).strftime('%m-%d %H:%M')
+    return f"{row['id']}  {row['account']:<12} {when}  {row['title']}\n     {row['cwd']}"
+
+def choose_session(sid=None, account=None):
+    rows = session_records(account)
+    if not sid:
+        return pick(rows, 'saved conversations', describe_session)
+    matches = [r for r in rows if r['id'].startswith(sid)]
+    if len(matches) != 1:
+        raise Error('Session ID must uniquely match a saved conversation; use codex-accounts sessions.')
+    return matches[0]
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+def active_runs():
+    runs = []
+    for path in (ROOT / 'runs').glob('*.json'):
+        row = read_json(path)
+        if row and alive(row['pid']):
+            runs.append(row)
+    return runs
+
+def guard_idle(row):
+    for run in active_runs():
+        if run['account'] == row['account'] and (run['session'] == row['id'] or run['session'] is None):
+            raise Error('The conversation may still be running. Close the source CLI first. '
+                        'New sessions on this account must also be closed before moving history.')
+
+def login(name, device=False, create=False):
+    home = account_home(name)
+    if create:
+        if home.exists():
+            raise Error('Account name already exists. Reconnect with: codex-accounts login ' + name)
+        private_dir(home)
+    else:
+        require_account(name)
+    with lock('account-' + name):
+        print(f'Connecting {name}. Select its ChatGPT account in the browser.', flush=True)
+        args = ['login'] + (['--device-auth'] if device else [])
+        status = subprocess.call(command(*args), env=environment(name))
+        if status:
+            raise Error(f'Login did not finish (exit {status}). Retry: codex-accounts login {name}')
+        if not (home / 'auth.json').is_file():
+            raise Error('Codex did not save file-based credentials. Check managed authentication settings.')
+        (home / 'auth.json').chmod(0o600)
+        print(f'Connected. Start with: codex-accounts run {name}')
+
+def run(name, row=None, prompt=None, cwd=None, model=None):
+    home = require_account(name)
+    if not (home / 'auth.json').is_file():
+        raise Error('Account has no cached login. Run: codex-accounts login ' + name)
+    working = Path(cwd or (row and row['cwd']) or os.getcwd()).expanduser().resolve()
+    if not working.is_dir():
+        raise Error('Project directory does not exist: ' + str(working))
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(lock('account-' + name, shared=True))
+        if row:
+            stack.enter_context(lock('session-' + row['id']))
+            if owners().get(row['id'], name) != name:
+                raise Error('This conversation has moved. Run resume again to use its current account.')
+        args = ['resume', row['id']] if row else []
+        args += ['--no-daemon', '--cd', str(working)]
+        if model:
+            args += ['--model', model]
+        cmd = command(*args)
+        if prompt:
+            cmd += ['--', prompt]
+        private_dir(ROOT / 'runs')
+        marker = ROOT / 'runs' / (str(uuid.uuid4()) + '.json')
+        atomic_json(marker, dict(pid=os.getpid(), account=name, session=row['id'] if row else None,
+                                 cwd=str(working), started=time.time()))
+        print(f'Account: {name} · Project: {working}', flush=True)
+        try:
+            return subprocess.call(cmd, env=environment(name), cwd=working)
+        finally:
+            marker.unlink(missing_ok=True)
+
+def move(row, target, already_locked=False):
+    require_account(target)
+    if row['account'] == target:
+        raise Error('This conversation already uses that account.')
+    if row['history_mode'] != 'legacy':
+        raise Error('Moving paginated history is not supported; no files were changed.')
+    if not (require_account(target) / 'auth.json').is_file():
+        raise Error('Connect the destination first: codex-accounts login ' + target)
+    with lock('account-' + row['account'], shared=True), lock('account-' + target, shared=True), \
+            (contextlib.nullcontext() if already_locked else lock('session-' + row['id'])), lock('registry'):
+        guard_idle(row)
+        if owners().get(row['id'], row['account']) != row['account']:
+            raise Error('Conversation changed accounts; retry with its current location.')
+        source = Path(row['path'])
+        existing = list((require_account(target) / 'sessions').rglob('*' + row['id'] + '.jsonl'))
+        if len(existing) > 1:
+            raise Error('Destination contains duplicate session histories; no files were changed.')
+        dest = existing[0] if existing else require_account(target) / 'sessions' / 'imported' / source.name
+        private_dir(dest.parent)
+        # An existing destination can contain older history from an earlier move.
+        # Keep a backup outside sessions before replacing it.
+        if dest.exists():
+            backup = ROOT / 'backups' / (str(uuid.uuid4()) + '.jsonl')
+            private_dir(backup.parent)
+            shutil.copy2(dest, backup)
+        fd, temp = tempfile.mkstemp(dir=dest.parent)
+        os.close(fd)
+        try:
+            before = source.stat()
+            shutil.copyfile(source, temp)
+            after = source.stat()
+            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                raise Error('Source changed while copying. Close the source session and retry.')
+            os.replace(temp, dest)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+        ownership = owners()
+        ownership[row['id']] = target
+        atomic_json(ROOT / 'owners.json', ownership)
+    print(f"Moved {row['id']} from {row['account']} to {target}.")
+    print('Original history retained. Continue with: codex-accounts resume ' + row['id'])
+
+def menu():
+    if not accounts():
+        if not sys.stdin.isatty():
+            raise Error('Connect your first account: codex-accounts add personal')
+        login(input('Name your first account (e.g. personal): ').strip(), create=True)
+        return 0
+    action = pick(['Automatic account routing', 'Start a conversation', 'Resume a conversation', 'Move a conversation',
+                   'Connect another account', 'List accounts'], 'actions', str)
+    if action == 'Automatic account routing':
+        return auto_run()
+    elif action == 'Connect another account':
+        login(input('Account name: ').strip(), create=True)
+    elif action == 'Start a conversation':
+        return run(choose_account())
+    elif action == 'Resume a conversation':
+        row = choose_session()
+        return run(row['account'], row)
+    elif action == 'Move a conversation':
+        row = choose_session()
+        move(row, choose_account())
+    else:
+        list_accounts()
+    return 0
+
+def list_accounts():
+    runs = active_runs()
+    if not accounts():
+        print('No accounts. Connect one with: codex-accounts add personal')
+    for name in accounts():
+        cached = (require_account(name) / 'auth.json').is_file()
+        count = sum(r['account'] == name for r in runs)
+        routing = read_json(ROOT / 'routing.json', {}).get(name, {})
+        remaining = max(0, int(routing.get('retry_after', 0) - time.time()))
+        cooldown = f' · retry eligible in {remaining // 60}m {remaining % 60}s' if remaining else ''
+        print(f"{name:<20} {'login cached' if cached else 'needs login':<15} {count} running{cooldown}")
+    print('Cached login does not verify current quota or token validity.')
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__, epilog='No command opens the interactive menu.')
+    p.add_argument('--version', action='version', version=VERSION)
+    sub = p.add_subparsers(dest='action')
+    for action in ['add', 'login']:
+        s = sub.add_parser(action, help='Connect a ChatGPT account' if action == 'add' else 'Reconnect an account')
+        s.add_argument('account')
+        s.add_argument('--device-auth', action='store_true')
+    sub.add_parser('list', help='Show accounts and running launcher processes')
+    s = sub.add_parser('auto', help='Native Codex terminal with automatic account failover')
+    s.add_argument('--account', help='Initial account; otherwise choose an available account')
+    s.add_argument('--resume', help='Resume a saved conversation with automatic failover')
+    s.add_argument('--prompt')
+    s.add_argument('--cd')
+    s.add_argument('--model')
+    s = sub.add_parser('run', help='Start a conversation with an account')
+    s.add_argument('account', nargs='?')
+    s.add_argument('--prompt')
+    s.add_argument('--cd')
+    s.add_argument('--model')
+    s = sub.add_parser('sessions', help='List saved conversations across accounts')
+    s.add_argument('--account')
+    s = sub.add_parser('resume', help='Resume using the conversation’s current account')
+    s.add_argument('session', nargs='?', help='Full or unambiguous prefix of a session UUID')
+    s.add_argument('--account', help='Filter the session picker')
+    s.add_argument('--prompt')
+    s.add_argument('--cd')
+    s.add_argument('--model')
+    s = sub.add_parser('switch', help='Move a closed conversation to another connected account')
+    s.add_argument('session')
+    s.add_argument('--to', required=True)
+    s = sub.add_parser('status', help='Ask Codex for the selected account’s login status')
+    s.add_argument('account')
+    return p
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    os.umask(0o077)
+    private_dir(ROOT)
+    if args.action is None:
+        return menu()
+    if args.action in ('add', 'login'):
+        login(args.account, args.device_auth, create=args.action == 'add')
+    elif args.action == 'list':
+        list_accounts()
+    elif args.action == 'status':
+        return subprocess.call(command('login', 'status'), env=environment(args.account))
+    elif args.action == 'auto':
+        return auto_run(args.account, args.resume, args.cd, args.model, args.prompt)
+    elif args.action == 'run':
+        return run(choose_account(args.account), prompt=args.prompt, cwd=args.cd, model=args.model)
+    elif args.action == 'sessions':
+        rows = session_records(args.account)
+        for row in rows:
+            print(describe_session(row))
+        if not rows:
+            print('No saved conversations found in launcher accounts.')
+    elif args.action == 'resume':
+        row = choose_session(args.session, args.account)
+        return run(row['account'], row, args.prompt, args.cd, args.model)
+    elif args.action == 'switch':
+        move(choose_session(args.session), args.to)
+    return 0
+
+# Automatic routing keeps the native Codex TUI connected to a local WebSocket
+# bridge. The backend remains the official Codex app-server (stdio transport).
+import base64
+import hashlib
+import select
+import signal
+import socket
+import struct
+from collections import deque
+
+QUOTA_ERRORS = {'usageLimitExceeded', 'rateLimitExceeded'}
+
+class WebSocket:
+    """Minimal RFC 6455 server transport over a private Unix-domain socket."""
+    def __init__(self, sock):
+        self.sock = sock
+        self.buffer = bytearray()
+        self.fragments = bytearray()
+        request = bytearray()
+        while b'\r\n\r\n' not in request:
+            data = sock.recv(4096)
+            if not data:
+                raise Error('Terminal closed during connection setup.')
+            request.extend(data)
+            if len(request) > 65536:
+                raise Error('Oversized WebSocket handshake.')
+        headers, _, remainder = request.partition(b'\r\n\r\n')
+        self.buffer.extend(remainder)
+        parsed = {}
+        for line in headers.decode('ascii').split('\r\n')[1:]:
+            key, _, value = line.partition(':')
+            parsed[key.lower()] = value.strip()
+        key = parsed.get('sec-websocket-key')
+        if not key:
+            raise Error('Missing WebSocket handshake key.')
+        digest = base64.b64encode(hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
+        sock.sendall(('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n'
+                      'Connection: Upgrade\r\nSec-WebSocket-Accept: '+digest+'\r\n\r\n').encode())
+
+    def send_frame(self, opcode, payload):
+        length = len(payload)
+        header = bytes([0x80 | opcode])
+        if length < 126:
+            header += bytes([length])
+        elif length < 65536:
+            header += b'\x7e' + struct.pack('!H', length)
+        else:
+            header += b'\x7f' + struct.pack('!Q', length)
+        self.sock.sendall(header + payload)
+
+    def send(self, message):
+        self.send_frame(1, json.dumps(message).encode())
+
+    def read(self):
+        data = self.sock.recv(65536)
+        if not data:
+            raise EOFError
+        self.buffer.extend(data)
+        messages = []
+        while len(self.buffer) >= 2:
+            first, second = self.buffer[:2]
+            size, offset = second & 127, 2
+            if size == 126:
+                if len(self.buffer) < 4: break
+                size, offset = struct.unpack('!H', self.buffer[2:4])[0], 4
+            elif size == 127:
+                if len(self.buffer) < 10: break
+                size, offset = struct.unpack('!Q', self.buffer[2:10])[0], 10
+            if not second & 128 or first & 0x70 or size > 64 * 1024 * 1024:
+                raise Error('Invalid or oversized WebSocket frame.')
+            if len(self.buffer) < offset + 4 + size: break
+            mask = self.buffer[offset:offset+4]
+            payload = bytes(v ^ mask[i % 4] for i,v in enumerate(self.buffer[offset+4:offset+4+size]))
+            del self.buffer[:offset+4+size]
+            opcode = first & 15
+            if opcode == 8:
+                raise EOFError
+            if opcode == 9:
+                self.send_frame(10, payload)
+                continue
+            if opcode == 10:
+                continue
+            if opcode not in (0, 1):
+                raise Error('Unsupported WebSocket message type.')
+            self.fragments.extend(payload)
+            if len(self.fragments) > 64 * 1024 * 1024:
+                raise Error('Oversized WebSocket message.')
+            if first & 0x80:
+                messages.append(json.loads(self.fragments))
+                self.fragments.clear()
+        return messages
+
+@contextlib.contextmanager
+def routing_state():
+    private_dir(ROOT / 'locks')
+    with (ROOT / 'locks/routing.lock').open('a') as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        state = read_json(ROOT / 'routing.json', {})
+        yield state
+        atomic_json(ROOT / 'routing.json', state)
+
+def eligible_accounts(exclude=()):
+    with routing_state() as state:
+        names = [name for name in accounts() if name not in exclude
+                 and (require_account(name) / 'auth.json').is_file()
+                 and state.get(name, {}).get('retry_after', 0) <= time.time()]
+        running = active_runs()
+        return sorted(names, key=lambda n: (sum(r['account']==n for r in running),
+                                             state.get(n, {}).get('last_selected', 0), n))
+
+def mark_selected(name):
+    with routing_state() as state:
+        state.setdefault(name, {})['last_selected'] = time.time()
+
+def mark_quota_failure(name, error, snapshot=None):
+    windows = [(snapshot or {}).get(k) or {} for k in ('primary','secondary')]
+    resets = [w.get('resetsAt') for w in windows if w.get('usedPercent', 0) >= 100
+              and isinstance(w.get('resetsAt'), (int,float)) and w['resetsAt'] > time.time()]
+    # A timer schedules another attempt; it does not claim quota has recovered.
+    delay = 60 if error == 'rateLimitExceeded' else 300
+    with routing_state() as state:
+        row = state.setdefault(name, {})
+        row['retry_after'] = max(resets) if resets else time.time() + delay
+        row['reason'] = error
+
+class Backend:
+    def __init__(self, name):
+        self.name = name
+        self.buffer = bytearray()
+        self.messages = deque()
+        self.logs = tempfile.TemporaryFile()
+        self.process = subprocess.Popen(command('app-server'), env=environment(name),
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=self.logs, start_new_session=True)
+    def send(self, message):
+        self.process.stdin.write((json.dumps(message)+'\n').encode())
+        self.process.stdin.flush()
+    def read(self):
+        data = os.read(self.process.stdout.fileno(), 65536)
+        if not data:
+            raise Error('Codex backend exited. Your saved conversation can be resumed.')
+        self.buffer.extend(data)
+        while b'\n' in self.buffer:
+            line, _, rest = self.buffer.partition(b'\n')
+            self.buffer[:] = rest
+            if line.strip():
+                self.messages.append(json.loads(line))
+    def close(self):
+        # This backend owns a dedicated process group. Stop its tools as well
+        # as the server before handing history to the next account.
+        try:
+            os.killpg(self.process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(self.process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        self.process.wait()
+        self.logs.close()
+
+class AutoBridge:
+    def __init__(self, name, ws, marker, factory=Backend):
+        self.name, self.ws, self.marker, self.factory = name, ws, marker, factory
+        self.backend = None
+        self.account_lock = None
+        self.session_lock = None
+        self.sid = None
+        self.initialize = None
+        self.pending = {}
+        self.counter = 0
+        self.tried = set()
+        self.snapshot = None
+        self.quota_errors = {}
+        self.thread_options = {}
+        self.continuation_options = {}
+        self.open_backend(name)
+    def open_backend(self, name):
+        self.account_lock = lock('account-' + name, shared=True)
+        self.account_lock.__enter__()
+        try:
+            self.backend = self.factory(name)
+        except BaseException:
+            self.account_lock.__exit__(None,None,None)
+            self.account_lock = None
+            raise
+        self.name = name
+        self.snapshot = None
+        mark_selected(name)
+        self.update_marker()
+    def close_backend(self):
+        if self.backend:
+            self.backend.close()
+            self.backend = None
+        if self.account_lock:
+            self.account_lock.__exit__(None,None,None)
+            self.account_lock = None
+    def update_marker(self):
+        atomic_json(self.marker, dict(pid=os.getpid(),account=self.name,session=self.sid,
+                                     cwd=os.getcwd(),started=time.time()))
+    def set_thread(self, thread):
+        sid = thread['id']
+        if sid != self.sid:
+            if self.session_lock:
+                self.session_lock.__exit__(None,None,None)
+                self.session_lock = None
+            new_lock = lock('session-' + sid)
+            new_lock.__enter__()
+            self.session_lock = new_lock
+            self.sid = sid
+        for key in ('model','cwd'):
+            if thread.get(key): self.thread_options[key] = thread[key]
+        self.update_marker()
+    def from_client(self, message):
+        method, params = message.get('method'), message.get('params', {})
+        if method == 'initialize':
+            self.initialize = params
+        if method in ('thread/start','thread/resume'):
+            # Preserve the client-selected permissions/model on reconnect.
+            self.thread_options = {k:v for k,v in params.items() if k in
+                ('model','cwd','approvalPolicy','approvalsReviewer','sandbox','serviceTier','personality','config')}
+        if method == 'turn/start':
+            self.tried = {self.name}
+            self.continuation_options = {k:v for k,v in params.items() if k in
+                ('model','cwd','approvalPolicy','approvalsReviewer','sandboxPolicy','effort','summary','serviceTier','personality')}
+        if 'id' in message and method:
+            self.pending[json.dumps(message['id'])] = method
+        self.backend.send(message)
+    def inspect(self, message):
+        method, params = message.get('method'), message.get('params', {})
+        if method == 'error' and params.get('threadId') == self.sid and not params.get('willRetry', True):
+            code = (params.get('error') or {}).get('codexErrorInfo')
+            if isinstance(code, str) and code in QUOTA_ERRORS:
+                self.quota_errors[params.get('turnId')] = code
+        if method == 'account/rateLimits/updated':
+            incoming = params.get('rateLimits') or {}
+            if not self.snapshot or incoming.get('limitId') == self.snapshot.get('limitId'):
+                self.snapshot = {**(self.snapshot or {}), **{k:v for k,v in incoming.items() if v is not None}}
+        if 'id' in message and not method:
+            original = self.pending.pop(json.dumps(message['id']), None)
+            if original in ('thread/start','thread/resume','thread/fork') and 'result' in message:
+                self.set_thread(message['result']['thread'])
+    def from_backend(self, message):
+        self.inspect(message)
+        self.ws.send(message)
+        if message.get('method') != 'turn/completed': return
+        params = message.get('params', {})
+        if params.get('threadId') != self.sid: return
+        turn = params.get('turn') or {}
+        info = (turn.get('error') or {}).get('codexErrorInfo') or self.quota_errors.get(turn.get('id'))
+        self.quota_errors.pop(turn.get('id'), None)
+        if turn.get('status') == 'failed' and isinstance(info, str) and info in QUOTA_ERRORS:
+            self.failover(info)
+    def rpc(self, method, params, timeout=30):
+        self.counter += 1
+        ident = 'codex-accounts-internal-' + str(self.counter)
+        self.backend.send(dict(id=ident,method=method,params=params))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            while self.backend.messages:
+                message = self.backend.messages.popleft()
+                if message.get('id') == ident:
+                    if 'error' in message: raise Error(str(message['error'].get('message','Codex request failed')))
+                    return message.get('result', {})
+                self.inspect(message)
+                self.ws.send(message)
+            if select.select([self.backend.process.stdout], [], [], .25)[0]:
+                self.backend.read()
+        raise Error('Codex reconnect timed out; saved conversation was retained.')
+    def failover(self, info):
+        mark_quota_failure(self.name, info, self.snapshot)
+        self.tried.add(self.name)
+        choices = eligible_accounts(self.tried)
+        if not choices or not self.sid:
+            return  # Original quota failure is already visible in the native TUI.
+        target = choices[0]
+        # Backend has reported the failed turn completed. Stop it before copying
+        # history, so no tools or history writers survive on the source account.
+        row = choose_session(self.sid)
+        self.close_backend()
+        self.marker.unlink(missing_ok=True)
+        # No in-flight request may be silently abandoned during reconnection.
+        for ident in list(self.pending):
+            self.ws.send(dict(id=json.loads(ident), error=dict(code=-32000,message='Account is reconnecting; retry this request.')))
+        self.pending.clear()
+        # The bridge already owns this conversation's exclusive lock.
+        with contextlib.redirect_stdout(io.StringIO()):
+            move(row, target, already_locked=True)
+        self.open_backend(target)
+        self.rpc('initialize', self.initialize)
+        self.backend.send(dict(method='initialized'))
+        resumed = self.rpc('thread/resume', dict(self.thread_options, threadId=self.sid))
+        self.set_thread(resumed['thread'])
+        self.tried.add(target)
+        # Publish the new account's plan to the existing native UI.
+        account = self.rpc('account/read', {'refreshToken':False}).get('account') or {}
+        self.ws.send(dict(method='account/updated',params=dict(authMode='chatgpt',planType=account.get('planType'))))
+        continuation = ('Continue the unfinished request from the preceding turn. The account reached its usage limit '
+                        'and the launcher reconnected this conversation using another account. Inspect the saved history '
+                        'and current state, preserve completed work, and do not repeat completed side effects.')
+        self.rpc('turn/start', dict(self.continuation_options, threadId=self.sid,
+                 input=[{'type':'text','text':continuation,'text_elements':[]}]))
+    def close(self):
+        self.close_backend()
+        if self.session_lock:
+            self.session_lock.__exit__(None,None,None)
+        self.marker.unlink(missing_ok=True)
+
+def auto_run(account=None, session=None, cwd=None, model=None, prompt=None):
+    if not sys.stdin.isatty():
+        raise Error('Automatic mode uses the native interactive Codex terminal; run it in a terminal.')
+    row = choose_session(session) if session else None
+    if row:
+        account = row['account']
+    choices = eligible_accounts()
+    if not account:
+        if not choices:
+            raise Error('No connected accounts are ready. Add an account or wait for its cooldown to expire.')
+        account = choices[0]
+    require_account(account)
+    if not (require_account(account) / 'auth.json').is_file():
+        raise Error('Connect this account first: codex-accounts login ' + account)
+    if row and account not in choices and choices:
+        move(row, choices[0])
+        account = choices[0]
+        row = choose_session(session)
+    working = str(Path(cwd or (row and row['cwd']) or os.getcwd()).expanduser().resolve())
+    if not Path(working).is_dir(): raise Error('Project directory does not exist: ' + working)
+    private_dir(ROOT / 'runs')
+    marker = ROOT / 'runs' / (str(uuid.uuid4()) + '.json')
+    # Keep Unix socket paths short enough for macOS's 104-byte sun_path.
+    with tempfile.TemporaryDirectory(prefix='codex-accounts-',dir='/tmp') as temp:
+        address = str(Path(temp) / 'tui.sock')
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(address); listener.listen(1); listener.settimeout(.25)
+        tui, bridge, connected = None, None, None
+        previous_sigint = signal.getsignal(signal.SIGINT)
+        try:
+            args = ['resume',row['id']] if row else []
+            args += ['--remote','unix://'+address,'--cd',working]
+            if model: args += ['--model',model]
+            cmd = command(*args)
+            if prompt: cmd += ['--',prompt]
+            print(f'Automatic account routing · starting with {account}', flush=True)
+            tui = subprocess.Popen(cmd, env=environment(account), cwd=working)
+            # Ctrl-C belongs to the foreground native TUI; keep its bridge alive.
+            signal.signal(signal.SIGINT, lambda *_: None)
+            deadline = time.monotonic()+30
+            while tui.poll() is None and time.monotonic()<deadline:
+                try:
+                    connected, _ = listener.accept(); break
+                except socket.timeout: pass
+            if connected is None:
+                if tui.poll() is not None: return tui.returncode
+                raise Error('Codex terminal did not connect within 30 seconds.')
+            connected.settimeout(5)
+            ws = WebSocket(connected)
+            bridge = AutoBridge(account, ws, marker)
+            while tui.poll() is None:
+                while bridge.backend.messages:
+                    bridge.from_backend(bridge.backend.messages.popleft())
+                ready,_,_ = select.select([connected,bridge.backend.process.stdout],[],[],.25)
+                if connected in ready:
+                    for message in ws.read(): bridge.from_client(message)
+                if bridge.backend.process.stdout in ready: bridge.backend.read()
+            return tui.returncode
+        except EOFError:
+            return tui.wait(timeout=5) if tui else 0
+        finally:
+            if bridge: bridge.close()
+            if tui and tui.poll() is None:
+                tui.terminate()
+                try: tui.wait(timeout=5)
+                except subprocess.TimeoutExpired: tui.kill(); tui.wait()
+            if connected: connected.close()
+            listener.close()
+            marker.unlink(missing_ok=True)
+            signal.signal(signal.SIGINT, previous_sigint)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (Error, OSError, ValueError) as exc:
+        print('codex-accounts: ' + str(exc), file=sys.stderr)
+        sys.exit(1)
+    except (KeyboardInterrupt, EOFError):
+        print('\nCancelled.', file=sys.stderr)
+        sys.exit(130)

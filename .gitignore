@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+auth.json
+.env
+.env.*
+accounts/
+runs/
+backups/
+*.jsonl
+routing.json
+owners.json
