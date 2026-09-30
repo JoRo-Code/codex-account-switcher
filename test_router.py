@@ -107,6 +107,15 @@ class RouterTests(unittest.TestCase):
         helper=result['result']['thread']['id']
         self.assertIs(r.sessions[helper],lane)
         self.assertEqual(lane.bridge.sid,self.sid)
+    def test_each_chat_preserves_its_client_identity_and_paginated_capability(self):
+        r,c=self.router()
+        d=Client();r.route(d,{'id':1,'method':'initialize','params':{'clientInfo':{'name':'desktop','version':'2'}}})
+        self.request(r,d,'thread/resume',{'threadId':self.sid})
+        lane=r.sessions[self.sid]
+        init=next(x for x in lane.bridge.backend.sent if x.get('method')=='initialize')
+        self.assertEqual(init['params']['clientInfo']['name'],'desktop')
+        self.assertTrue(init['params']['capabilities']['experimentalApi'])
+
     def test_auth_mutation_is_rejected(self):
         r,c=self.router()
         with self.assertRaises(app.Error):r.route(c,{'id':9,'method':'account/logout'})

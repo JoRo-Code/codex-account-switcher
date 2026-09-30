@@ -19,7 +19,7 @@ import textwrap
 import uuid
 import unicodedata
 
-VERSION = '0.8.0'
+VERSION = '0.8.1'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -1853,6 +1853,7 @@ class MultiRouter:
         self.preferred, self.factory = preferred, factory
         self.mutex = threading.RLock()
         self.clients = set()
+        self.client_initializes = {}
         self.lanes = set()
         self.sessions = {}
         self.controls = {}
@@ -1871,9 +1872,11 @@ class MultiRouter:
         if not choices: raise Error('No accounts are ready. Add an account or wait for quota to reset.')
         return choices
 
-    def lane(self, account, control=False):
+    def lane(self, account, control=False, initialize=None):
         if self.closed: raise Error('Router is shutting down.')
-        lane = RouterLane(self, account, self.initialize, control)
+        options = dict(initialize or self.initialize)
+        options['capabilities'] = dict(options.get('capabilities') or {}, experimentalApi=True)
+        lane = RouterLane(self, account, options, control)
         self.lanes.add(lane)
         return lane
 
@@ -1939,6 +1942,7 @@ class MultiRouter:
     def disconnect(self, client):
         with self.mutex:
             self.clients.discard(client)
+            self.client_initializes.pop(client, None)
             # Keep actors alive; replies to departed clients are dropped.
             for ident, pending in list(self.requests.items()):
                 if pending[0] is client:
@@ -1952,6 +1956,7 @@ class MultiRouter:
             with self.mutex:
                 if self.initialize is None: self.initialize = params
                 self.clients.add(client)
+                self.client_initializes[client] = params
                 lane = self.control()
             response = lane.ready.result(timeout=35)
             with self.mutex:
@@ -1987,11 +1992,11 @@ class MultiRouter:
             if lane and lane.stopped.is_set(): lane = None
             if method == 'thread/start' or (method == 'thread/fork' and not params.get('ephemeral')):
                 account = choose_session(sid)['account'] if sid else self.available()[0]
-                lane = self.lane(account)
+                lane = self.lane(account, initialize=self.client_initializes[client])
             elif sid and lane is None:
                 row = choose_session(sid)
                 if method == 'thread/resume':
-                    lane = self.lane(row['account'])
+                    lane = self.lane(row['account'], initialize=self.client_initializes[client])
                     self.sessions[sid] = lane
                 elif method.startswith('turn/') or method == 'thread/compact/start':
                     raise Error('Resume this conversation before starting or steering a turn.')
