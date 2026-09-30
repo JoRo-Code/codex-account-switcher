@@ -16,7 +16,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = '0.4.2'
+VERSION = '0.4.3'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -129,12 +129,12 @@ def defaults(model=None, effort=None, clear=False):
     print(json.dumps(settings, indent=2) if settings else 'Use each account’s Codex configuration.')
     print('Applies to new launches across all accounts. --model and in-chat selections override defaults.')
 
-def command(*args):
+def command(*args, include_permissions=True):
     if not shutil.which(BINARY):
         raise Error('Codex CLI was not found on PATH. Install Codex first.')
     return [BINARY, *args, '-c', 'cli_auth_credentials_store="file"',
             '-c', 'forced_login_method="chatgpt"', '-c', 'model_provider="openai"',
-            *model_args(), *permission_args()]
+            *model_args(), *(permission_args() if include_permissions else [])]
 
 def owners():
     return read_json(ROOT / 'owners.json', {})
@@ -1257,7 +1257,9 @@ def auto_run(account=None, session=None, cwd=None, model=None, prompt=None):
             args = ['resume',row['id']] if row else []
             args += ['--remote','unix://'+address,'--cd',working]
             if model: args += ['--model',model]
-            cmd = command(*args)
+            # Remote resume uses the task's saved permissions. The CLI rejects
+            # permission overrides here; shared defaults still reach the backend.
+            cmd = command(*args, include_permissions=not bool(row))
             if prompt: cmd += ['--',prompt]
             print(f'Automatic account routing · starting with {account}', flush=True)
             tui = subprocess.Popen(cmd, env=environment(account), cwd=working)
@@ -1295,7 +1297,7 @@ def auto_run(account=None, session=None, cwd=None, model=None, prompt=None):
             marker.unlink(missing_ok=True)
             signal.signal(signal.SIGINT, previous_sigint)
             if bridge:
-                auto_exit_message(bridge.sid)
+                auto_exit_message(bridge.sid or (row and row['id']))
 
 
 if __name__ == '__main__':

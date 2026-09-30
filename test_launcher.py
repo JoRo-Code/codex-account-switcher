@@ -72,6 +72,13 @@ class LauncherTests(unittest.TestCase):
         with self.assertRaises(app.Error):
             app.command('app-server')
 
+    def test_remote_resume_omits_unsupported_permission_overrides(self):
+        app.atomic_json(app.ROOT/'permissions.json', {'mode':'yolo'})
+        cmd = app.command('resume', self.sid, '--remote', 'unix:///tmp/test.sock', include_permissions=False)
+        self.assertNotIn('approval_policy="never"', cmd)
+        self.assertNotIn('sandbox_mode="danger-full-access"', cmd)
+        self.assertIn('approval_policy="never"', app.command('app-server'))
+
     def test_auto_exit_prints_valid_launcher_resume_for_saved_chat(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
