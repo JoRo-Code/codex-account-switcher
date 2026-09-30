@@ -107,6 +107,8 @@ When Codex reports that a turn has completed with a structured `usageLimitExceed
 
 You do not need to close the terminal, find the session ID, move the history, or type another prompt. The native UI may briefly show the original quota error before the continuation starts. Other conversations have their own backends and continue independently. Shared cooldowns also guide new launches.
 
+Exiting the terminal also stops this launcher's backend. Codex may print a generic remote-mode message saying work continues and suggesting a temporary socket reconnect command; that does not apply to this launcher. Use the `codex-accounts auto --resume SESSION_ID` command printed afterward to reopen a saved chat. Starting `auto --account NAME` again creates a new chat.
+
 Only structured quota errors trigger this behavior, after Codex's own retries have ended. Generic errors, authentication failures, and subagent notifications do not trigger account switching. The model and permission choices are carried forward. This is a new continuation turn with the existing history, not resumption of an interrupted network response. The launcher does not rerun tool commands itself; model continuation cannot guarantee exactly-once external side effects.
 
 Each account is tried at most once per failed-turn chain. If every connected account is exhausted, the terminal stays open with the failure and saved history; it does not spin or wait indefinitely. You can submit a new turn later, resume later, or connect another account. A cooldown expiring only makes an account eligible for another attempt; it does not establish that quota recovered.

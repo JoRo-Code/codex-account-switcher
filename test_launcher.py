@@ -72,6 +72,18 @@ class LauncherTests(unittest.TestCase):
         with self.assertRaises(app.Error):
             app.command('app-server')
 
+    def test_auto_exit_prints_valid_launcher_resume_for_saved_chat(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            app.auto_exit_message(self.sid)
+        self.assertIn('codex-accounts auto --resume ' + self.sid, output.getvalue())
+        self.assertIn('work is not continuing', output.getvalue())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            app.auto_exit_message('unsaved-session')
+        self.assertNotIn('--resume', output.getvalue())
+        self.assertIn('No saved chat', output.getvalue())
+
     def test_model_defaults_keep_explicit_override_and_partial_updates(self):
         with contextlib.redirect_stdout(io.StringIO()):
             app.defaults('test-model', 'high')

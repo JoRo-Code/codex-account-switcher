@@ -16,7 +16,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = '0.4.1'
+VERSION = '0.4.2'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -1215,6 +1215,15 @@ class AutoBridge:
             self.session_lock.__exit__(None,None,None)
         self.marker.unlink(missing_ok=True)
 
+def auto_exit_message(sid):
+    print('\nLauncher stopped its backend; work is not continuing in the background.')
+    print('The temporary --remote socket above is closed. Do not use that reconnect command.')
+    if sid and any(row['id'] == sid for row in session_records()):
+        print('Resume this saved chat with:')
+        print('  codex-accounts auto --resume ' + sid)
+    else:
+        print('No saved chat was found for this launch. Start again with codex-accounts auto.')
+
 def auto_run(account=None, session=None, cwd=None, model=None, prompt=None):
     if not sys.stdin.isatty():
         raise Error('Automatic mode uses the native interactive Codex terminal; run it in a terminal.')
@@ -1285,6 +1294,8 @@ def auto_run(account=None, session=None, cwd=None, model=None, prompt=None):
             listener.close()
             marker.unlink(missing_ok=True)
             signal.signal(signal.SIGINT, previous_sigint)
+            if bridge:
+                auto_exit_message(bridge.sid)
 
 
 if __name__ == '__main__':
