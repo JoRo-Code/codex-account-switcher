@@ -19,7 +19,7 @@ import textwrap
 import uuid
 import unicodedata
 
-VERSION = '0.8.1'
+VERSION = '0.9.0'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -655,11 +655,13 @@ def menu():
         login(input('Name your first account (e.g. personal): ').strip(), create=True)
         return 0
     action = pick(['Continue an existing chat', 'Automatic account routing', 'Start a conversation', 'Resume a conversation', 'Move a conversation',
-                   'Connect another account', 'Conversation overview', 'Account status', 'List accounts'], 'actions', str)
+                   'Connect another account', 'Set up Codex Desktop', 'Conversation overview', 'Account status', 'List accounts'], 'actions', str)
     if action == 'Continue an existing chat':
         return continue_chat()
     elif action == 'Automatic account routing':
         return auto_run()
+    elif action == 'Set up Codex Desktop':
+        return setup_desktop()
     elif action == 'Connect another account':
         login(input('Account name: ').strip(), create=True)
     elif action == 'Account status':
@@ -1186,6 +1188,15 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__, epilog='No command opens the interactive menu.')
     p.add_argument('--version', action='version', version=VERSION)
     sub = p.add_subparsers(dest='action')
+    s = sub.add_parser('setup', help='Connect accounts and configure native Desktop on macOS')
+    s.add_argument('--account', help='Preferred initial account')
+    s.add_argument('--port', type=int, help='Optional fixed localhost SSH port')
+    s = sub.add_parser('desktop', help='Manage the Desktop background services')
+    s.add_argument('operation', choices=['status','start','stop','restart'])
+    s.add_argument('--json', action='store_true')
+    sub.add_parser('desktop-shell', help=argparse.SUPPRESS)
+    s = sub.add_parser('desktop-proxy', help=argparse.SUPPRESS)
+    s.add_argument('arguments', nargs=argparse.REMAINDER)
     s = sub.add_parser('serve', help='Persistent multi-session account router (experimental)')
     s.add_argument('--socket', required=True)
     s.add_argument('--account', help='Preferred account for new chats')
@@ -1247,12 +1258,21 @@ def parser():
     s.add_argument('--watch', action='store_true', help='Refresh in place until Ctrl-C')
     s.add_argument('--interval', type=int, default=30, help='Watch refresh seconds (minimum 10)')
     s.add_argument('--json', action='store_true', help='Print a structured snapshot')
+    sub._choices_actions = [a for a in sub._choices_actions if a.help != argparse.SUPPRESS]
+    sub.metavar = '{'+','.join(name for name in sub.choices if name not in ('desktop-shell','desktop-proxy'))+'}'
     return p
 
 def main(argv=None):
     args = parser().parse_args(argv)
     os.umask(0o077)
     private_dir(ROOT)
+    if args.action == 'setup': return setup_desktop(args.account,args.port)
+    if args.action == 'desktop-shell': return desktop_shell()
+    if args.action == 'desktop-proxy': return desktop_proxy(args.arguments)
+    if args.action == 'desktop':
+        if args.operation=='status': desktop_status(args.json)
+        else: desktop_service(args.operation)
+        return 0
     if args.action == 'serve':
         return serve_router(args.socket, args.account)
     if args.action == 'permissions':
@@ -2086,6 +2106,16 @@ class RouterClient:
 
 def serve_router(address, preferred=None):
     path=Path(address).expanduser().resolve()
+    with lock('router-'+hashlib.sha256(str(path).encode()).hexdigest()[:16]):
+        if path.exists() and stat.S_ISSOCK(path.stat().st_mode):
+            probe=socket.socket(socket.AF_UNIX)
+            try: probe.connect(str(path))
+            except ConnectionRefusedError: path.unlink()
+            finally: probe.close()
+        return _serve_router(address,preferred)
+
+def _serve_router(address, preferred=None):
+    path=Path(address).expanduser().resolve()
     if len(str(path).encode())>100: raise Error('Use a shorter Unix socket path (under 100 bytes).')
     if path.exists(): raise Error('Socket path already exists; stop its owner before replacing it.')
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -2128,10 +2158,257 @@ def serve_router(address, preferred=None):
     return 0
 
 
+# macOS onboarding owns only its named services and generated SSH alias.
+import getpass
+import plistlib
+import shlex
+import stat
+
+DESKTOP_FILE = 'desktop/settings.json'
+
+def desktop_settings():
+    settings=read_json(ROOT/DESKTOP_FILE)
+    if not settings: raise Error('Run codex-accounts setup first.')
+    return settings
+
+def desktop_label(kind):
+    digest=hashlib.sha256(str(ROOT).encode()).hexdigest()[:8]
+    return 'ai.codex-accounts.'+kind+'.'+digest
+
+def launchctl_loaded(label):
+    return subprocess.run(['launchctl','print',f'gui/{os.getuid()}/'+label],
+                          stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
+
+def desktop_service(action):
+    if sys.platform!='darwin': raise Error('Desktop onboarding currently supports macOS only.')
+    settings=desktop_settings()
+    if action=='restart':
+        desktop_service('stop')
+        return desktop_service('start')
+    for kind in ('router','ssh') if action=='start' else ('ssh','router'):
+        label=desktop_label(kind)
+        loaded=launchctl_loaded(label)
+        if action=='start' and not loaded:
+            subprocess.run(['launchctl','bootstrap',f'gui/{os.getuid()}',settings['plists'][kind]],check=True)
+        elif action=='stop' and loaded:
+            subprocess.run(['launchctl','bootout',f'gui/{os.getuid()}/'+label],check=True)
+    print('Desktop services '+('started.' if action=='start' else 'stopped. Saved accounts and chats are retained.'))
+
+def desktop_status(as_json=False):
+    settings=desktop_settings()
+    status={k:settings[k] for k in ('alias','port','account','socket')}
+    status['services']={k:launchctl_loaded(desktop_label(k)) for k in ('router','ssh')}
+    for kind,address,family in [('router',settings['socket'],socket.AF_UNIX),
+                                ('ssh',('127.0.0.1',settings['port']),socket.AF_INET)]:
+        sock=socket.socket(family);sock.settimeout(1)
+        try:sock.connect(address);status[kind+'_reachable']=True
+        except OSError:status[kind+'_reachable']=False
+        finally:sock.close()
+    if as_json: print(json.dumps(status,indent=2))
+    else:
+        print('CODEX AUTO')
+        for kind in ('router','ssh'):
+            print(kind.title()+': '+('ready' if status[kind+'_reachable'] else 'not reachable'))
+        print('Desktop hostname: '+settings['alias'])
+        print('Account activity: codex-accounts overview --history')
+        print('Logs: '+str(ROOT/'desktop/logs'))
+    return status
+
+def write_private_text(path,text,mode=0o600):
+    private_dir(path.parent)
+    fd,temp=tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd,'w') as f:f.write(text)
+        os.chmod(temp,mode);os.replace(temp,path)
+    finally:
+        if os.path.exists(temp):os.unlink(temp)
+
+def desktop_config(account, port, alias, native, home):
+    base=ROOT/'desktop'
+    digest=hashlib.sha256(str(ROOT).encode()).hexdigest()[:8]
+    address=f'/tmp/ca-{os.getuid()}-{digest}/router.sock'
+    return dict(format_version=1,account=account,port=port,alias=alias,native=native,socket=address,
+                user=getpass.getuser(),launcher=str(executable_path()),python=sys.executable,
+                plists={k:str(home/'Library/LaunchAgents'/(desktop_label(k)+'.plist')) for k in ('router','ssh')})
+
+def generate_desktop_files(settings, home):
+    base=ROOT/'desktop'
+    private_dir(base);private_dir(base/'logs');private_dir(base/'client-home')
+    for name in ('host_key','client_key'):
+        key=base/name
+        if not key.exists():
+            subprocess.run(['ssh-keygen','-q','-t','ed25519','-N','','-C','codex-accounts-'+name,'-f',str(key)],check=True)
+        if not key.with_suffix('.pub').is_file():raise Error('Missing public key for '+str(key))
+    hostkey=(base/'host_key.pub').read_text().split()
+    write_private_text(base/'known_hosts',f"[127.0.0.1]:{settings['port']} {hostkey[0]} {hostkey[1]}\n")
+    invoke='exec env CODEX_ACCOUNTS_HOME='+shlex.quote(str(ROOT))+' '+shlex.quote(settings['python'])+' '+shlex.quote(settings['launcher'])
+    write_private_text(base/'bin/codex','#!/bin/sh\n'+invoke+' desktop-proxy -- "$@"\n',0o700)
+    write_private_text(base/'ssh-command','#!/bin/sh\n'+invoke+' desktop-shell\n',0o700)
+    path=str(base/'bin')+':'+str(Path(settings['native']).parent)+':/usr/bin:/bin:/usr/sbin:/sbin'
+    for name in ('.zshenv','.zprofile'):
+        write_private_text(base/name,'export PATH='+shlex.quote(path)+'\n')
+    # OpenSSH config accepts quoted paths, including spaces.
+    quote=lambda value:'"'+str(value).replace('\\','\\\\').replace('"','\\"')+'"'
+    sshd=f'''Port {settings['port']}
+ListenAddress 127.0.0.1
+HostKey {quote(base/'host_key')}
+PidFile {quote(base/'sshd.pid')}
+AuthorizedKeysFile {quote(base/'client_key.pub')}
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+UsePAM no
+StrictModes yes
+AllowUsers {settings['user']}
+AllowTcpForwarding no
+AllowAgentForwarding no
+X11Forwarding no
+PermitTunnel no
+LogLevel ERROR
+ForceCommand {shlex.quote(str(base/'ssh-command'))}
+'''
+    write_private_text(base/'sshd_config',sshd)
+    snippet=base/'ssh_config'
+    write_private_text(snippet,f'''Host {settings['alias']}
+  HostName 127.0.0.1
+  User {settings['user']}
+  Port {settings['port']}
+  IdentityFile {quote(base/'client_key')}
+  IdentitiesOnly yes
+  ProxyCommand none
+  ProxyJump none
+  UserKnownHostsFile {quote(base/'known_hosts')}
+  StrictHostKeyChecking yes
+''')
+    config=home/'.ssh/config';include='Include '+quote(snippet)
+    old=config.read_text() if config.exists() else ''
+    if include not in old.splitlines():
+        if config.exists() and not (base/'ssh_config.before').exists():
+            write_private_text(base/'ssh_config.before',old)
+        write_private_text(config,include+'\n'+old)
+    env={'CODEX_ACCOUNTS_HOME':str(ROOT),'CODEX_ACCOUNTS_BINARY':settings['native'],
+         'PATH':str(Path(settings['native']).parent)+':/usr/bin:/bin:/usr/sbin:/sbin'}
+    commands={'router':[settings['python'],settings['launcher'],'serve','--socket',settings['socket'],'--account',settings['account']],
+              'ssh':['/usr/sbin/sshd','-D','-e','-f',str(base/'sshd_config')]}
+    for kind,args in commands.items():
+        plist=Path(settings['plists'][kind])
+        data={'Label':desktop_label(kind),'ProgramArguments':args,'EnvironmentVariables':env,
+              'RunAtLoad':True,'KeepAlive':True,'ThrottleInterval':10,'ExitTimeOut':60,'WorkingDirectory':str(base),
+              'StandardOutPath':str(base/'logs'/(kind+'.log')),'StandardErrorPath':str(base/'logs'/(kind+'.log'))}
+        # Do not change permissions on the user's shared LaunchAgents directory.
+        plist.parent.mkdir(parents=True,exist_ok=True)
+        fd,temp=tempfile.mkstemp(dir=plist.parent)
+        try:
+            with os.fdopen(fd,'wb') as f:plistlib.dump(data,f)
+            os.chmod(temp,0o600);os.replace(temp,plist)
+        finally:
+            if os.path.exists(temp):os.unlink(temp)
+    atomic_json(ROOT/DESKTOP_FILE,settings)
+
+def setup_desktop(account=None, port=None):
+    if port is not None and not 1 <= port <= 65535: raise Error('SSH port must be between 1 and 65535.')
+    if sys.platform!='darwin':raise Error('Automatic Desktop setup currently supports macOS only. CLI routing remains available.')
+    if not shutil.which('ssh-keygen') or not Path('/usr/sbin/sshd').is_file():raise Error('OpenSSH is required for Desktop setup.')
+    prior=read_json(ROOT/DESKTOP_FILE)
+    if prior:
+        settings=dict(prior)
+        changed=(account and account!=prior['account'] or port and port!=prior['port'] or
+                 prior['launcher']!=str(executable_path()) or prior['python']!=sys.executable or prior.get('format_version')!=1)
+        if changed:
+            if any(launchctl_loaded(desktop_label(k)) for k in ('router','ssh')):
+                raise Error('Stop services with codex-accounts desktop stop before changing this setup; active chats would otherwise be interrupted.')
+            settings.update(format_version=1,account=account or prior['account'],port=port or prior['port'],
+                            launcher=str(executable_path()),python=sys.executable)
+            generate_desktop_files(settings,Path.home())
+    else:
+        connected=[n for n in accounts() if (account_home(n)/'auth.json').is_file()]
+        if not connected:
+            if not sys.stdin.isatty():raise Error('Connect an account first: codex-accounts add NAME; then run codex-accounts setup.')
+            print('1. Connect your ChatGPT accounts')
+            while True:
+                name=input('Account label (for example personal): ').strip()
+                login(name,False,create=name not in accounts())
+                if input('Add another account? [y/N] ').strip().lower()!='y':break
+            connected=[n for n in accounts() if (account_home(n)/'auth.json').is_file()]
+        if account:
+            if account not in connected:raise Error('Connect this account first: codex-accounts add '+account)
+        else:
+            print('Checking account availability…',flush=True)
+            account=select_ready_account(collect_status())['label']
+        native=shutil.which(BINARY)
+        if not native:raise Error('Install the Codex CLI first.')
+        # Resolve a free loopback port before writing any service configuration.
+        probe=socket.socket()
+        try:probe.bind(('127.0.0.1',port or 0));port=probe.getsockname()[1]
+        finally:probe.close()
+        alias='codex-auto'
+        resolved=subprocess.run(['ssh','-G',alias],capture_output=True,text=True)
+        hostname=next((line.split(None,1)[1] for line in resolved.stdout.splitlines() if line.startswith('hostname ')),alias)
+        if hostname!=alias:alias+='-'+hashlib.sha256(str(ROOT).encode()).hexdigest()[:8]
+        if any((parent/'.git').exists() for parent in executable_path().parents):
+            raise Error('Install first with python3 install.py, then run the installed codex-accounts setup.')
+        settings=desktop_config(account,port,alias,str(Path(native).absolute()),Path.home())
+        generate_desktop_files(settings,Path.home())
+    subprocess.run(['/usr/sbin/sshd','-t','-f',str(ROOT/'desktop/sshd_config')],check=True)
+    desktop_service('start')
+    deadline=time.monotonic()+15
+    last='Services are starting.'
+    while time.monotonic()<deadline:
+        check=subprocess.run(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=2',settings['alias'],'codex app-server daemon version'],capture_output=True,text=True)
+        if check.returncode==0:
+            try:
+                if json.loads(check.stdout).get('status')=='running':break
+            except ValueError:pass
+        last=check.stderr.strip();time.sleep(.5)
+    else:raise Error('Setup saved, but SSH verification failed: '+last+'. Run codex-accounts desktop status.')
+    print('\nReady. Services will start when you log in to this Mac.')
+    print('In Codex Desktop → Settings → Connections → SSH, select '+settings['alias']+'.')
+    print('If it is not listed, Add a connection: display name Codex Auto; hostname '+settings['alias']+'.')
+    print('Leave port and identity blank; the SSH alias supplies both.')
+    print('Then add a project on Codex Auto and start a new chat.')
+    print('Add more accounts anytime: codex-accounts add NAME')
+    print('See usage and assignments: codex-accounts overview')
+    return 0
+
+def desktop_shell():
+    settings=desktop_settings();base=ROOT/'desktop';env=dict(os.environ)
+    for key in AUTH_ENV:env.pop(key,None)
+    env.update(CODEX_ACCOUNTS_HOME=str(ROOT),CODEX_ACCOUNTS_BINARY=settings['native'],
+               CODEX_HOME=str(base/'client-home'),ZDOTDIR=str(base),
+               PATH=str(base/'bin')+':'+str(Path(settings['native']).parent)+':/usr/bin:/bin:/usr/sbin:/sbin')
+    os.execve('/bin/zsh',['zsh','-c',os.environ.get('SSH_ORIGINAL_COMMAND') or 'exit 0'],env)
+
+def desktop_proxy(args):
+    settings=desktop_settings();native=settings['native'];address=settings['socket']
+    if args[:1]==['--']:args=args[1:]
+    index=args.index('app-server') if 'app-server' in args else None
+    if index is not None:
+        rest=args[index+1:]
+        if rest[:1]==['daemon']:
+            if len(rest)<2 or rest[1] not in ('version','start','bootstrap'):
+                raise Error('Use codex-accounts desktop start/stop/restart to manage the router.')
+            probe=socket.socket(socket.AF_UNIX)
+            try:probe.connect(address)
+            finally:probe.close()
+            version=subprocess.check_output([native,'--version'],text=True).strip().split()[-1]
+            print(json.dumps(dict(status='running',managedCodexPath=str(ROOT/'desktop/bin/codex'),managedCodexVersion=version,
+                                  socketPath=address,cliVersion=version,appServerVersion=version)))
+            return 0
+        if not rest or rest[0] in ('proxy','-c','--config','--listen','--stdio','--analytics-default-enabled'):
+            os.execv(native,[native,'app-server','proxy','--sock',address])
+    if '--remote' in args:
+        index=args.index('--remote')
+        if index+1<len(args):args[index+1]='unix://'+address
+    # Do not silently start an unmanaged chat outside the router.
+    if not args or args[0] in ('login','logout','exec','resume'):
+        raise Error('Use the Codex Auto Desktop project or codex-accounts auto for chats; codex-accounts add/login manages accounts.')
+    os.execv(native,[native,*args])
+
+
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (Error, OSError, ValueError, sqlite3.Error) as exc:
+    except (Error, OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as exc:
         print('codex-accounts: ' + str(exc), file=sys.stderr)
         sys.exit(1)
     except (KeyboardInterrupt, EOFError):

@@ -4,6 +4,30 @@ A local launcher for multiple ChatGPT accounts in Codex CLI. Automatic mode keep
 
 > **Experimental:** simulated failover and offline compatibility checks pass. Live quota failover has not yet been validated.
 
+## Set up native Codex Desktop (macOS)
+
+After installing, run:
+
+```sh
+codex-accounts setup
+```
+
+The wizard guides browser login if you have no connected accounts, checks available quota, creates a dedicated localhost SSH key and alias, and installs two user LaunchAgents for the router and SSH endpoint. They start when you log in and restart after a crash. Existing accounts, histories, and permissions are preserved. Re-running setup leaves running services and keys unchanged. No admin password, macOS Remote Login, external server, or Python packages are needed.
+
+In native Codex Desktop, open **Settings → Connections → SSH** and select **codex-auto**. If it is not listed, add a connection with display name **Codex Auto** and hostname **codex-auto**. Leave port and identity blank: OpenSSH supplies them from the generated alias. If that alias was already taken, setup prints a unique alternative. Add a project folder on this host, then start a new chat there. The final Desktop connection/project selection is manual; setup does not control Desktop's UI or move existing chats automatically.
+
+```sh
+codex-accounts add work             # Browser login for another account
+codex-accounts overview --history   # Account usage and chat assignments
+codex-accounts desktop status       # Check router and SSH readiness
+codex-accounts desktop stop         # Stop managed services and active router work
+codex-accounts desktop start        # Start services again
+```
+
+For a single install-and-setup command, use `python3 install.py --setup`. Use `setup --account LABEL` to select the initial account explicitly or `--port NUMBER` for a fixed localhost port. To change an existing setup's account or port, stop its services first, then rerun setup with the desired option. `desktop restart` loads updated router code and interrupts active router work; do it between turns. Updates and reinstalls preserve credentials and configuration. After a reboot, log in to start the services, then let Desktop reconnect.
+
+Generated configuration, keys, logs, and settings live under `~/.local/share/codex-accounts/desktop`. Setup adds one Include line to `~/.ssh/config` and retains a backup before its first change. It does not replace existing SSH hosts or native Codex daemons. Only macOS onboarding is packaged today; Linux CLI and manual router usage remain available.
+
 ## Continue a chat you already have
 
 ```sh
@@ -20,7 +44,7 @@ codex-accounts continue billing --account codex2
 
 An existing local chat is imported as a separate terminal copy. Its original stays in Desktop or the ordinary CLI; later messages do not sync between copies. After import the picker prefers the launcher copy so it does not repeatedly import the original. Stop/close the original session before importing; Codex's native writer lock may prevent import while the original remains loaded. Credentials, plugins, and account configuration are not copied. Launcher defaults and the chat's saved settings apply as described below.
 
-This does **not** switch the account of an in-place Desktop chat. Desktop account switching and a menu-bar account picker are not implemented or verified. Cloud-only ChatGPT chats are not imported. The supported automatic switching occurs in the launcher terminal.
+This does **not** switch the account of an in-place Desktop chat. The Codex Auto SSH connection provides a separate managed backend for native Desktop. A menu-bar account picker is not implemented. Cloud-only ChatGPT chats are not imported.
 
 If limits cannot be verified, the launcher asks you to check status or choose `--account NAME` explicitly instead of silently treating an unknown account as available. Known blocked accounts are rejected. `--source-home PATH` searches another existing Codex home; `--json` lists matches without starting or importing a chat.
 
@@ -34,7 +58,7 @@ codex-accounts overview --account codex2
 
 Shows current connected emails and live quota, saved conversations per account, open launcher sessions, project locations, and recorded account usage. `--history` includes timestamped opens, observed turn starts, imports, and account moves. `--include-local` adds local/Desktop chats whose account history is unknown; `--json` provides structured output, and `--limit N` changes the default 20-chat limit. It is also available in the no-argument menu.
 
-Starting in v0.7.0, activity is stored in the private `activity.sqlite` database and survives process exit and updates. Restart older launcher sessions to enable recording. A stored history file indicates its current location, not which account executed all its old turns. Imported history is not retroactively attributed to the destination account. A move records an assignment; an observed turn start records execution under that account. Exact per-chat quota consumption and Desktop activity are unavailable. Emails shown identify accounts currently connected to each label; the audit tracks labels. New manual CLI sessions do not expose a reliable chat ID, so their launches are retained separately in JSON rather than guessed.
+Starting in v0.7.0, activity is stored in the private `activity.sqlite` database and survives process exit and updates. Restart older launcher sessions to enable recording. A stored history file indicates its current location, not which account executed all its old turns. Imported history is not retroactively attributed to the destination account. A move records an assignment; an observed turn start records execution under that account. Exact per-chat quota consumption and activity outside the managed router are unavailable. Emails shown identify accounts currently connected to each label; the audit tracks labels. New manual CLI sessions do not expose a reliable chat ID, so their launches are retained separately in JSON rather than guessed.
 
 Since v0.7.1, temporary helper threads cannot replace the main chat’s tracking or reconnect settings. Unmatched sessions from older launchers appear separately as unverified tracking. Exit and reopen those sessions with `codex-accounts continue` when convenient; updating does not replace code already loaded in running processes.
 
@@ -258,13 +282,13 @@ codex app-server proxy --sock /tmp/codex-accounts-$UID/router.sock
 
 Native terminal clients can connect with `codex --remote unix:///tmp/codex-accounts-$UID/router.sock`. The socket accepts both native newline-JSON proxy traffic and WebSockets, and is accessible only to your OS user. Do not expose it over a public network.
 
-For Desktop, the SSH host's Codex entry point must forward its app-server/proxy requests to this socket. Merely adding an ordinary SSH host does **not** enable rotation. The local SSH adapter remains an experimental setup, not a packaged one-click installer. Existing Desktop connections need reconnecting to use a changed adapter; do so between turns. Do not replace a live native daemon or its socket. Use `codex-accounts overview --history` to see account assignments and moves.
+For Desktop, the SSH host's Codex entry point must forward its app-server/proxy requests to this socket. Merely adding an ordinary SSH host does **not** enable rotation. The macOS `setup` command installs this adapter and its background services; Desktop still requires a connection/project selection. Existing Desktop connections need reconnecting to use a changed adapter; do so between turns. Do not replace a live native daemon or its socket. Use `codex-accounts overview --history` to see account assignments and moves.
 
 The native account indicator describes the router's primary control account, not every chat's execution account or combined quota. Manage authentication with `codex-accounts add/login`; authentication changes from connected protocol clients are rejected. Chat history lists combine connected accounts and deduplicate moved histories. Pending approval request IDs are isolated between backends and replayed after reconnect. Settings/plugins that are not thread-scoped still belong to the primary account's backend; full Desktop plugin/browser/automation parity has not been verified.
 
 Validation includes native proxy connections, two chats, client reconnect, combined history, and an injected quota failure that migrates history through real Codex backends while another chat remains accessible. The injection sends no model request. Actual quota exhaustion and seamless native Desktop UI recovery after rotation still require a live test. Automatic continuation is a new turn and does not guarantee exactly-once tool side effects.
 
-Stopping `serve` stops its managed backends and tools. Saved histories and account assignments remain available for a later start. This release does not install a launch-at-login service. Run the optional compatibility test after upgrading Codex:
+Stopping `serve` stops its managed backends and tools. Saved histories and account assignments remain available for a later start. Running `serve` directly does not install a launch-at-login service; use `setup` for managed startup on macOS. Run the optional compatibility test after upgrading Codex:
 
 ```sh
 python3 test_native_router.py

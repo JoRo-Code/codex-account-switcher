@@ -11,6 +11,7 @@ import tempfile
 source = Path(__file__).resolve().with_name('codex-accounts')
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--bin-dir', type=Path, default=Path.home() / '.local/bin', help='Installation directory (default: ~/.local/bin)')
+parser.add_argument('--setup', action='store_true', help='Run Desktop onboarding after installation')
 args = parser.parse_args()
 bin_dir = args.bin_dir.expanduser().resolve()
 destination = bin_dir / 'codex-accounts'
@@ -42,4 +43,7 @@ if str(bin_dir) not in os.environ.get('PATH', '').split(os.pathsep):
     print('Add this line to your shell configuration:')
     import shlex
     print('export PATH=' + shlex.quote(str(bin_dir)) + ':"$PATH"')
-print('Next: codex-accounts add personal')
+print('Next: codex-accounts setup')
+if args.setup:
+    import subprocess
+    sys.exit(subprocess.call([sys.executable,str(destination),'setup']))
