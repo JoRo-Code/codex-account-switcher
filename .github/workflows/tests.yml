@@ -19,4 +19,5 @@ jobs:
       - run: python test_status.py
       - run: python test_update.py
       - run: python test_continue.py
+      - run: python test_overview.py
       - run: python codex-accounts --help

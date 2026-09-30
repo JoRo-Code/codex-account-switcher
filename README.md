@@ -10,7 +10,7 @@ A local launcher for multiple ChatGPT accounts in Codex CLI. Automatic mode keep
 codex-accounts continue
 ```
 
-Choose a chat by title and project. Type text to filter the list, a number to continue, or `n` for the next page. The picker includes launcher chats and locally saved chats in `~/.codex`, including local Desktop and ordinary CLI chats. It checks live limits, keeps the current account when available, and selects another account when the current one is blocked. Before opening the terminal it shows the account email, quota, and automatic-switching status.
+Choose a chat by title and project in the full-screen picker. Type to search instantly, use arrow keys to move, and press Enter to open. Tab cycles between this project, all projects, and launcher chats; Esc cancels. If the current directory has chats, the picker starts there. Compact columns show account, project, and date; the selected chat’s details appear below. Terminals without curses support fall back to a numbered picker. The picker includes launcher chats and locally saved chats in `~/.codex`, including local Desktop and ordinary CLI chats. It checks live limits, keeps the current account when available, and selects another account when the current one is blocked. Before opening the terminal it shows the account email, quota, and automatic-switching status.
 
 ```sh
 codex-accounts continue billing          # Search by title or project
@@ -23,6 +23,18 @@ An existing local chat is imported as a separate terminal copy. Its original sta
 This does **not** switch the account of an in-place Desktop chat. Desktop account switching and a menu-bar account picker are not implemented or verified. Cloud-only ChatGPT chats are not imported. The supported automatic switching occurs in the launcher terminal.
 
 If limits cannot be verified, the launcher asks you to check status or choose `--account NAME` explicitly instead of silently treating an unknown account as available. Known blocked accounts are rejected. `--source-home PATH` searches another existing Codex home; `--json` lists matches without starting or importing a chat.
+
+## Account and conversation overview
+
+```sh
+codex-accounts overview
+codex-accounts overview rence --history
+codex-accounts overview --account codex2
+```
+
+Shows current connected emails and live quota, saved conversations per account, open launcher sessions, project locations, and recorded account usage. `--history` includes timestamped opens, observed turn starts, imports, and account moves. `--include-local` adds local/Desktop chats whose account history is unknown; `--json` provides structured output, and `--limit N` changes the default 20-chat limit. It is also available in the no-argument menu.
+
+Starting in v0.7.0, activity is stored in the private `activity.sqlite` database and survives process exit and updates. Restart older launcher sessions to enable recording. A stored history file indicates its current location, not which account executed all its old turns. Imported history is not retroactively attributed to the destination account. A move records an assignment; an observed turn start records execution under that account. Exact per-chat quota consumption and Desktop activity are unavailable. Emails shown identify accounts currently connected to each label; the audit tracks labels. New manual CLI sessions do not expose a reliable chat ID, so their launches are retained separately in JSON rather than guessed.
 
 ## Install
 
@@ -199,6 +211,7 @@ python3 test_update.py
 python3 test_native_history.py
 python3 test_native_paginated_history.py
 python3 test_continue.py
+python3 test_overview.py
 ```
 
 Tests cover isolated credentials/environment, concurrent account locks, duplicate-resume protection, active-session move protection, complete history preservation and round trips, unsupported-format rejection, argument forwarding, and account-name validation. The paginated native check verifies A → B → A migration with a stale destination index, two preserved turns, pagination, and native writer locks. The legacy offline native check verifies that the installed Codex app server discovers the moved history and reads its user and assistant messages, without making a model request. Additional tests simulate quota failover, exhaustion of all accounts, concurrent-session routing, cooldowns, preservation of model/approval settings, isolation of subagent events, pending RPC handling, and WebSocket framing. The real native terminal was also connected through the bridge up to its authentication check. Live identity and quota retrieval have been checked with connected accounts. Model requests and real quota failover are not exercised by the tests. Automatic failover is implemented but has not yet been validated against a live account quota failure.

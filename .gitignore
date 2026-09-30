@@ -14,5 +14,6 @@ owners.json
 updates.json
 permissions.json
 defaults.json
+activity.sqlite*
 .codex-accounts.install.json
 .codex-accounts.previous
