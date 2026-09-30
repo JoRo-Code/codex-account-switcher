@@ -34,6 +34,8 @@ codex-accounts list
 
 Each `add` runs the official Codex browser login. Select the correct ChatGPT account in the browser; signing into the same account twice does not give separate quotas. If browser login is inconvenient, use `add NAME --device-auth` (requires device login enabled for your account). Use `login NAME` to reconnect later.
 
+`list` asks each account’s Codex backend for its cached email and plan, so you can identify which ChatGPT login each label represents. It does not refresh tokens or verify remaining quota. If an identity cannot be read, that row says `identity unavailable`; other accounts still appear.
+
 Credentials remain local under `~/.local/share/codex-accounts/accounts/NAME/auth.json`. They are stored with private permissions, and Codex performs its own token refresh. Account names are labels you choose; they do not verify the identity you select in the browser. `status NAME` asks Codex for cached login status; it does not fetch quota or guarantee token validity.
 
 ## Daily use: automatic mode
@@ -50,7 +52,7 @@ codex-accounts auto --account personal    # Choose the starting account
 codex-accounts auto --resume SESSION_ID  # Continue an existing saved conversation
 codex-accounts auto --cd /path/to/project --prompt "Fix the login page"
 codex-accounts sessions
-codex-accounts list                      # Accounts, running sessions, cooldowns
+codex-accounts list                      # Labels, emails, plans, running sessions, cooldowns
 ```
 
 When Codex reports that a turn has completed with a structured `usageLimitExceeded` or `rateLimitExceeded` error, automatic mode:

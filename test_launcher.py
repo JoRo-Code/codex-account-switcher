@@ -112,5 +112,41 @@ class LauncherTests(unittest.TestCase):
     def test_titles_are_extracted_without_tool_output(self):
         self.assertEqual(app.choose_session(self.sid)['title'], 'Fix login page')
 
+    def test_list_displays_email_and_plan_and_handles_one_failed_lookup(self):
+        def identity(name):
+            if name == 'work':
+                raise app.Error('do not expose raw backend errors or tokens')
+            return ('person@example.com', 'pro', 'cached')
+        output = io.StringIO()
+        with patch.object(app, 'account_identity', side_effect=identity), contextlib.redirect_stdout(output):
+            app.list_accounts()
+        text = output.getvalue()
+        self.assertIn('person@example.com', text)
+        self.assertIn('pro', text)
+        self.assertIn('identity unavailable', text)
+        self.assertNotIn('raw backend errors', text)
+
+    def test_identity_uses_account_read_without_refresh_and_closes_backend(self):
+        from collections import deque
+        class Stub:
+            def __init__(self):
+                self.messages = deque()
+                self.sent = []
+                self.closed = False
+            def send(self, message):
+                self.sent.append(message)
+                if message.get('method') == 'initialize':
+                    self.messages.append({'id': 1, 'result': {}})
+                if message.get('method') == 'account/read':
+                    self.messages.append({'id': 2, 'result': {'account': {
+                        'type': 'chatgpt', 'email': 'person@example.com', 'planType': 'plus'}}})
+            def close(self):
+                self.closed = True
+        backend = Stub()
+        with patch.object(app, 'Backend', return_value=backend):
+            self.assertEqual(app.account_identity('personal'), ('person@example.com', 'plus', 'cached'))
+        self.assertTrue(backend.closed)
+        self.assertIn({'id': 2, 'method': 'account/read', 'params': {'refreshToken': False}}, backend.sent)
+
 if __name__ == '__main__':
     unittest.main()

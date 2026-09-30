@@ -16,7 +16,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = '0.2.0'
+VERSION = '0.2.1'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -309,18 +309,64 @@ def menu():
         list_accounts()
     return 0
 
+def account_identity(name, timeout=8):
+    """Ask Codex for cached identity, without refreshing or exposing credentials."""
+    with lock('account-' + name, shared=True):
+        backend = Backend(name)
+        deadline = time.monotonic() + timeout
+        def request(ident, method, params):
+            backend.send(dict(id=ident, method=method, params=params))
+            while time.monotonic() < deadline:
+                while backend.messages:
+                    message = backend.messages.popleft()
+                    if message.get('id') == ident:
+                        if 'error' in message:
+                            raise Error('Account identity unavailable.')
+                        return message.get('result', {})
+                if select.select([backend.process.stdout], [], [], .1)[0]:
+                    backend.read()
+            raise Error('Account identity lookup timed out.')
+        try:
+            request(1, 'initialize', {'clientInfo': {'name': 'codex_accounts_identity', 'version': VERSION}})
+            backend.send({'method': 'initialized'})
+            account = request(2, 'account/read', {'refreshToken': False}).get('account')
+            if not account:
+                return ('—', '—', 'needs login')
+            if account.get('type') != 'chatgpt':
+                return ('—', '—', 'not a ChatGPT login')
+            def clean(value):
+                return ''.join(c for c in str(value or '—') if c.isprintable())
+            return (clean(account.get('email')), clean(account.get('planType')), 'cached')
+        finally:
+            backend.close()
+
 def list_accounts():
     runs = active_runs()
-    if not accounts():
+    names = accounts()
+    if not names:
         print('No accounts. Connect one with: codex-accounts add personal')
-    for name in accounts():
-        cached = (require_account(name) / 'auth.json').is_file()
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    def identify(name):
+        if not (require_account(name) / 'auth.json').is_file():
+            return ('—', '—', 'needs login')
+        try:
+            return account_identity(name)
+        except (Error, OSError, ValueError):
+            return ('—', '—', 'identity unavailable')
+    with ThreadPoolExecutor(max_workers=min(4, len(names))) as pool:
+        identities = dict(zip(names, pool.map(identify, names)))
+    email_width = max(5, *(len(identity[0]) for identity in identities.values()))
+    plan_width = max(4, *(len(identity[1]) for identity in identities.values()))
+    print(f"{'LABEL':<20} {'EMAIL':<{email_width}}  {'PLAN':<{plan_width}}  {'STATUS':<22} RUNNING")
+    for name in names:
         count = sum(r['account'] == name for r in runs)
         routing = read_json(ROOT / 'routing.json', {}).get(name, {})
         remaining = max(0, int(routing.get('retry_after', 0) - time.time()))
         cooldown = f' · retry eligible in {remaining // 60}m {remaining % 60}s' if remaining else ''
-        print(f"{name:<20} {'login cached' if cached else 'needs login':<15} {count} running{cooldown}")
-    print('Cached login does not verify current quota or token validity.')
+        email, plan, status = identities[name]
+        print(f"{name:<20} {email:<{email_width}}  {plan:<{plan_width}}  {status:<22} {count}{cooldown}")
+    print('Email and plan are from cached Codex identity; quota and token validity are not checked.')
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__, epilog='No command opens the interactive menu.')
