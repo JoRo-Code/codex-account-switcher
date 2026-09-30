@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -138,12 +139,66 @@ class LauncherTests(unittest.TestCase):
         self.quiet_move(app.choose_session(self.sid), 'work')
         self.assertEqual(app.choose_session(self.sid)['account'], 'work')
 
-    def test_paginated_move_fails_without_changes(self):
+    def test_unknown_history_move_fails_without_changes(self):
         row = app.choose_session(self.sid)
-        row['history_mode']='paginated'
+        row['history_mode']='future-format'
         with self.assertRaises(app.Error):
             self.quiet_move(row, 'work')
         self.assertFalse(list((app.account_home('work')/'sessions').rglob('*.jsonl')))
+
+    def test_paginated_move_invalidates_only_selected_thread_projection(self):
+        self.rows[0]['payload']['history_mode'] = 'paginated'
+        self.path.write_text(''.join(json.dumps(x)+'\n' for x in self.rows))
+        dbpath = app.account_home('work')/'thread_history_1.sqlite'
+        with sqlite3.connect(dbpath) as db:
+            for table in ('thread_items','thread_turns','thread_history_projection_state','thread_realtime_items'):
+                db.execute('CREATE TABLE '+table+' (thread_id TEXT, content TEXT)')
+                db.executemany('INSERT INTO '+table+' VALUES (?,?)', [(self.sid,'stale'),('other','keep')])
+        self.quiet_move(app.choose_session(self.sid), 'work')
+        self.assertEqual(Path(app.choose_session(self.sid)['path']).read_bytes(), self.path.read_bytes())
+        with sqlite3.connect(dbpath) as db:
+            for table in ('thread_items','thread_turns','thread_history_projection_state','thread_realtime_items'):
+                self.assertEqual(db.execute('SELECT * FROM '+table).fetchall(), [('other','keep')])
+
+    def test_unknown_projection_schema_leaves_destination_and_owner_unchanged(self):
+        dest = app.account_home('work')/'sessions'/self.path.name
+        dest.parent.mkdir(); dest.write_text('previous content')
+        with sqlite3.connect(app.account_home('work')/'thread_history_1.sqlite') as db:
+            db.execute('CREATE TABLE future_history (thread_id TEXT)')
+        with self.assertRaises(app.Error): self.quiet_move(app.choose_session(self.sid), 'work')
+        self.assertEqual(dest.read_text(), 'previous content')
+        self.assertFalse(app.owners())
+
+    def test_move_respects_native_writer_locks(self):
+        for name in ('personal','work'):
+            with app.history_writer_lock(app.account_home(name), self.sid):
+                with self.assertRaises(app.Error): self.quiet_move(app.choose_session(self.sid), 'work')
+        self.assertFalse(app.owners())
+
+    def test_projection_and_rollout_rollback_if_activation_fails(self):
+        dbpath = app.account_home('work')/'thread_history_1.sqlite'
+        with sqlite3.connect(dbpath) as db:
+            db.execute('CREATE TABLE thread_items (thread_id TEXT, content TEXT)')
+            db.execute('INSERT INTO thread_items VALUES (?,?)',(self.sid,'old'))
+        with patch.object(app.os,'replace',side_effect=OSError('test activation failure')):
+            with self.assertRaises(OSError): self.quiet_move(app.choose_session(self.sid),'work')
+        with sqlite3.connect(dbpath) as db:
+            self.assertEqual(db.execute('SELECT content FROM thread_items').fetchone(),('old',))
+        self.assertFalse(app.owners())
+
+    def test_failed_projection_commit_restores_replaced_rollout(self):
+        dest = app.account_home('work')/'sessions'/self.path.name
+        dest.parent.mkdir(); dest.write_text('older destination')
+        original = app.reset_history_projection
+        @contextlib.contextmanager
+        def fail_commit(home, sid):
+            with original(home,sid):
+                yield
+                raise sqlite3.OperationalError('test commit failure')
+        with patch.object(app,'reset_history_projection',fail_commit):
+            with self.assertRaises(sqlite3.Error): self.quiet_move(app.choose_session(self.sid),'work')
+        self.assertEqual(dest.read_text(),'older destination')
+        self.assertFalse(app.owners())
 
     def test_two_account_processes_can_hold_locks_concurrently(self):
         with app.lock('account-personal', shared=True), app.lock('account-work', shared=True):

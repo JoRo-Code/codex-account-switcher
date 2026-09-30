@@ -6,7 +6,7 @@ A local launcher for multiple ChatGPT accounts in Codex CLI. Automatic mode keep
 
 ## Install
 
-Requires macOS or Linux, Python 3.9+, and a Codex CLI supporting `--remote unix://` and the app-server protocol (transport checked against installed Codex 0.158.0). Manual mode also uses `--no-daemon`. Automatic mode depends on an experimental Codex interface, so rerun the tests after CLI upgrades.
+Requires macOS or Linux, Python 3.9+, and a Codex CLI supporting `--remote unix://` and the app-server protocol (transport and paginated migration checked against installed Codex 0.159.2). Manual mode also uses `--no-daemon`. Automatic mode depends on an experimental Codex interface, so rerun the tests after CLI upgrades.
 
 ```sh
 git clone https://github.com/JoRo-Code/codex-account-switcher.git
@@ -138,11 +138,11 @@ codex-accounts switch SESSION_ID --to work
 codex-accounts resume SESSION_ID
 ```
 
-The launcher copies the complete saved legacy JSONL history to the destination account, records the new owner, and retains the original. Moving back replaces the destination's older copy after backing it up. Existing project files stay in place. The target account must already be connected.
+The launcher copies the complete saved legacy or paginated JSONL history to the destination account, records the new owner, and retains the original. Moving back replaces the destination's older copy after backing it up. Existing project files stay in place. The target account must already be connected.
 
 Use the launcher's `resume` after moving, rather than a native `/resume` picker inside another running Codex session. Native pickers may still expose retained old copies. The launcher tracks only processes launched through it; it cannot detect a session opened outside it or a different session selected through native `/resume`. Close those before moving. A known running conversation blocks its own move; other resumed conversations can continue. A newly started CLI session has no registered ID yet, so moving from that account conservatively requires closing its new-session processes first.
 
-History transfer is a local, version-sensitive mechanism, not a built-in OpenAI account-switch feature. Paginated history is rejected. Subagent sessions are separate histories and are not moved automatically. Automatic mode uses the same history transfer after a structured quota failure. It does not fetch remaining quota in advance or automatically migrate paginated/subagent histories.
+History transfer is a local, version-sensitive mechanism, not a built-in OpenAI account-switch feature. Paginated history stays paginated: the destination’s derived history index is cleared only for this chat, and Codex rebuilds it from the copied log on resume. Native Codex writer locks prevent copying active histories. Unknown database versions or schemas fail before replacing history. Subagent sessions are separate histories and are not moved automatically. Automatic mode uses the same history transfer after a structured quota failure. It does not fetch remaining quota in advance or automatically migrate subagent histories.
 
 ## Configuration and scope
 
@@ -177,15 +177,16 @@ python3 test_auto.py
 python3 test_status.py
 python3 test_update.py
 python3 test_native_history.py
+python3 test_native_paginated_history.py
 ```
 
-Tests cover isolated credentials/environment, concurrent account locks, duplicate-resume protection, active-session move protection, complete history preservation and round trips, unsupported-format rejection, argument forwarding, and account-name validation. The offline native check verifies that the installed Codex app server discovers the moved history and reads its user and assistant messages, without making a model request. Additional tests simulate quota failover, exhaustion of all accounts, concurrent-session routing, cooldowns, preservation of model/approval settings, isolation of subagent events, pending RPC handling, and WebSocket framing. The real native terminal was also connected through the bridge up to its authentication check. Live identity and quota retrieval have been checked with connected accounts. Model requests and real quota failover are not exercised by the tests. Automatic failover is implemented but has not yet been validated against a live account quota failure.
+Tests cover isolated credentials/environment, concurrent account locks, duplicate-resume protection, active-session move protection, complete history preservation and round trips, unsupported-format rejection, argument forwarding, and account-name validation. The paginated native check verifies A → B → A migration with a stale destination index, two preserved turns, pagination, and native writer locks. The legacy offline native check verifies that the installed Codex app server discovers the moved history and reads its user and assistant messages, without making a model request. Additional tests simulate quota failover, exhaustion of all accounts, concurrent-session routing, cooldowns, preservation of model/approval settings, isolation of subagent events, pending RPC handling, and WebSocket framing. The real native terminal was also connected through the bridge up to its authentication check. Live identity and quota retrieval have been checked with connected accounts. Model requests and real quota failover are not exercised by the tests. Automatic failover is implemented but has not yet been validated against a live account quota failure.
 
 Official building blocks: [authentication](https://learn.chatgpt.com/docs/auth) and [configuration/state locations](https://learn.chatgpt.com/docs/config-file/config-advanced).
 
 ## Development and license
 
-The launcher uses only the Python standard library. Unit tests run without a Codex installation; the optional native history test requires Codex. GitHub Actions runs the unit tests on macOS and Linux.
+The launcher uses only the Python standard library. Unit tests run without a Codex installation; the optional native history tests require Codex. GitHub Actions runs the unit tests on macOS and Linux.
 
 Report bugs in [GitHub Issues](https://github.com/JoRo-Code/codex-account-switcher/issues). Include the CLI versions and error text, but never attach `auth.json`, tokens, or private conversation histories.
 

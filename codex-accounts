@@ -10,13 +10,14 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
 
-VERSION = '0.4.3'
+VERSION = '0.5.0'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -290,16 +291,62 @@ def run(name, row=None, prompt=None, cwd=None, model=None):
         finally:
             marker.unlink(missing_ok=True)
 
+@contextlib.contextmanager
+def history_writer_lock(home, sid):
+    # Coordinate with Codex's own per-thread writer lock, including clients
+    # launched outside this wrapper. Never copy a live writer's rollout.
+    directory = home / 'thread-writer-locks'
+    private_dir(directory)
+    with (directory / (sid + '.lock')).open('a') as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Error('Codex is using this conversation. Stop it before moving its history.')
+        yield
+
+@contextlib.contextmanager
+def reset_history_projection(home, sid):
+    # Paginated messages are durable in the rollout. These tables are derived
+    # indexes: Codex rebuilds them on resume. Invalidate ONLY this thread so an
+    # older destination copy cannot mask newly copied turns on a round trip.
+    databases = list(home.glob('thread_history_*.sqlite'))
+    if not databases:
+        yield
+        return
+    if len(databases) != 1 or databases[0].name != 'thread_history_1.sqlite':
+        raise Error('Unsupported Codex history database version; no history was replaced.')
+    db = sqlite3.connect(databases[0], timeout=5)
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        expected = {'thread_turns', 'thread_items', 'thread_history_projection_state', 'thread_realtime_items'}
+        if tables - expected - {'_sqlx_migrations', 'sqlite_sequence'}:
+            raise Error('Unsupported Codex history schema; no history was replaced.')
+        for table in sorted(tables & expected):
+            columns = {r[1] for r in db.execute('PRAGMA table_info("' + table + '")')}
+            if 'thread_id' not in columns:
+                raise Error('Unsupported Codex history schema; no history was replaced.')
+            db.execute('DELETE FROM "' + table + '" WHERE thread_id = ?', (sid,))
+        yield
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
 def move(row, target, already_locked=False):
     require_account(target)
     if row['account'] == target:
         raise Error('This conversation already uses that account.')
-    if row['history_mode'] != 'legacy':
-        raise Error('Moving paginated history is not supported; no files were changed.')
+    if row['history_mode'] not in ('legacy', 'paginated'):
+        raise Error('Unknown history format; no files were changed.')
     if not (require_account(target) / 'auth.json').is_file():
         raise Error('Connect the destination first: codex-accounts login ' + target)
     with lock('account-' + row['account'], shared=True), lock('account-' + target, shared=True), \
-            (contextlib.nullcontext() if already_locked else lock('session-' + row['id'])), lock('registry'):
+            (contextlib.nullcontext() if already_locked else lock('session-' + row['id'])), lock('registry'), \
+            history_writer_lock(require_account(row['account']), row['id']), \
+            history_writer_lock(require_account(target), row['id']):
         guard_idle(row)
         if owners().get(row['id'], row['account']) != row['account']:
             raise Error('Conversation changed accounts; retry with its current location.')
@@ -311,19 +358,30 @@ def move(row, target, already_locked=False):
         private_dir(dest.parent)
         # An existing destination can contain older history from an earlier move.
         # Keep a backup outside sessions before replacing it.
+        backup = None
         if dest.exists():
             backup = ROOT / 'backups' / (str(uuid.uuid4()) + '.jsonl')
             private_dir(backup.parent)
             shutil.copy2(dest, backup)
         fd, temp = tempfile.mkstemp(dir=dest.parent)
         os.close(fd)
+        replaced = False
         try:
             before = source.stat()
             shutil.copyfile(source, temp)
             after = source.stat()
             if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                 raise Error('Source changed while copying. Close the source session and retry.')
-            os.replace(temp, dest)
+            with reset_history_projection(require_account(target), row['id']):
+                os.replace(temp, dest)
+                replaced = True
+        except BaseException:
+            if replaced:
+                if backup:
+                    shutil.copyfile(backup, dest)
+                else:
+                    dest.unlink(missing_ok=True)
+            raise
         finally:
             if os.path.exists(temp):
                 os.unlink(temp)
@@ -1198,7 +1256,10 @@ class AutoBridge:
         self.open_backend(target)
         self.rpc('initialize', self.initialize)
         self.backend.send(dict(method='initialized'))
-        resumed = self.rpc('thread/resume', dict(self.thread_options, threadId=self.sid))
+        resume_options = dict(self.thread_options, threadId=self.sid)
+        if row['history_mode'] == 'paginated':
+            resume_options['excludeTurns'] = True
+        resumed = self.rpc('thread/resume', resume_options)
         self.set_thread(resumed['thread'])
         self.tried.add(target)
         # Publish the new account's plan to the existing native UI.
@@ -1303,7 +1364,7 @@ def auto_run(account=None, session=None, cwd=None, model=None, prompt=None):
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (Error, OSError, ValueError) as exc:
+    except (Error, OSError, ValueError, sqlite3.Error) as exc:
         print('codex-accounts: ' + str(exc), file=sys.stderr)
         sys.exit(1)
     except (KeyboardInterrupt, EOFError):

@@ -78,6 +78,17 @@ class AutoTests(unittest.TestCase):
         self.assertEqual(calls['turn/start']['model'], 'chosen-model')
         self.assertEqual(calls['turn/start']['effort'], 'high')
 
+    def test_paginated_failover_uses_metadata_resume_then_continues(self):
+        self.rows[0]['payload']['history_mode'] = 'paginated'
+        self.path.write_text(''.join(json.dumps(x)+'\n' for x in self.rows))
+        bridge = self.make_bridge()
+        with patch.object(bridge,'rpc',side_effect=self.fake_rpc) as rpc:
+            bridge.from_backend(self.completion())
+        calls = {call.args[0]:call.args[1] for call in rpc.call_args_list}
+        self.assertTrue(calls['thread/resume']['excludeTurns'])
+        self.assertEqual(calls['turn/start']['threadId'],self.sid)
+        self.assertEqual(app.choose_session(self.sid)['account'],'work')
+
     def test_all_accounts_exhausted_stops_without_looping(self):
         bridge=self.make_bridge()
         with patch.object(bridge,'rpc',side_effect=self.fake_rpc) as rpc:
