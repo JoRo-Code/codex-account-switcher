@@ -16,4 +16,5 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python test_launcher.py
       - run: python test_auto.py
+      - run: python test_status.py
       - run: python codex-accounts --help

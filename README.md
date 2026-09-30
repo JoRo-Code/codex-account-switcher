@@ -36,7 +36,29 @@ Each `add` runs the official Codex browser login. Select the correct ChatGPT acc
 
 `list` asks each account’s Codex backend for its cached email and plan, so you can identify which ChatGPT login each label represents. It does not refresh tokens or verify remaining quota. If an identity cannot be read, that row says `identity unavailable`; other accounts still appear.
 
-Credentials remain local under `~/.local/share/codex-accounts/accounts/NAME/auth.json`. They are stored with private permissions, and Codex performs its own token refresh. Account names are labels you choose; they do not verify the identity you select in the browser. `status NAME` asks Codex for cached login status; it does not fetch quota or guarantee token validity.
+Credentials remain local under `~/.local/share/codex-accounts/accounts/NAME/auth.json`. They are stored with private permissions, and Codex performs its own token refresh. Account names are labels you choose; they do not verify the identity you select in the browser. `status NAME` fetches live usage limits and shows launcher sessions for that account; `status` without a name shows all accounts.
+
+## Account dashboard
+
+```sh
+codex-accounts status               # Live snapshot of all accounts
+codex-accounts status --watch       # Keep open; refresh every 30 seconds
+codex-accounts status codex1        # One account
+codex-accounts status --json        # Structured snapshot for your own tools
+```
+
+Each account shows:
+
+- Its label, signed-in email, and cached plan.
+- Quota windows returned by Codex, including remaining/used percentages and reset times in your local timezone.
+- Backend-reported usage blocks, spending limits, workspace credits, and earned resets when available.
+- Launcher sessions: project path, conversation ID, title, model, process ID, and time open.
+- Automatic-session activity: starting, working, waiting for input, idle, failed, or switching accounts.
+- Account routing cooldowns.
+
+`--watch --interval 60` changes the refresh interval (minimum 10 seconds). Press Ctrl-C to close the dashboard; running conversations keep going. If a lookup fails, that account shows limits unavailable while the others remain visible. Unknown limits are never reported as zero usage. Displayed reset times do not establish that backend access has recovered. The dashboard does not redeem resets, buy credits, send notifications, or change routing state.
+
+Limits come from OpenAI's account endpoint and can reflect usage outside the launcher. Session locations cover only launcher processes on this computer; desktop sessions and ordinary `codex` processes are not inventoried. Manual mode reports the CLI as open because it cannot observe turn activity. Restart older launcher processes to get the new project/title/activity tracking. Workspace credit balances can be shared across accounts and should not be summed as independent allowances.
 
 ## Daily use: automatic mode
 
@@ -113,10 +135,11 @@ This controls the CLI only. It does not change the desktop app, IDE extension, o
 ```sh
 python3 test_launcher.py
 python3 test_auto.py
+python3 test_status.py
 python3 test_native_history.py
 ```
 
-Tests cover isolated credentials/environment, concurrent account locks, duplicate-resume protection, active-session move protection, complete history preservation and round trips, unsupported-format rejection, argument forwarding, and account-name validation. The offline native check verifies that the installed Codex app server discovers the moved history and reads its user and assistant messages, without making a model request. Additional tests simulate quota failover, exhaustion of all accounts, concurrent-session routing, cooldowns, preservation of model/approval settings, isolation of subagent events, pending RPC handling, and WebSocket framing. The real native terminal was also connected through the bridge up to its authentication check. Live multi-account authentication and model requests require the user's browser sign-ins and are not exercised by the tests. Automatic failover is implemented but has not yet been validated against a live account quota failure.
+Tests cover isolated credentials/environment, concurrent account locks, duplicate-resume protection, active-session move protection, complete history preservation and round trips, unsupported-format rejection, argument forwarding, and account-name validation. The offline native check verifies that the installed Codex app server discovers the moved history and reads its user and assistant messages, without making a model request. Additional tests simulate quota failover, exhaustion of all accounts, concurrent-session routing, cooldowns, preservation of model/approval settings, isolation of subagent events, pending RPC handling, and WebSocket framing. The real native terminal was also connected through the bridge up to its authentication check. Live identity and quota retrieval have been checked with connected accounts. Model requests and real quota failover are not exercised by the tests. Automatic failover is implemented but has not yet been validated against a live account quota failure.
 
 Official building blocks: [authentication](https://learn.chatgpt.com/docs/auth) and [configuration/state locations](https://learn.chatgpt.com/docs/config-file/config-advanced).
 

@@ -16,7 +16,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = '0.2.1'
+VERSION = '0.3.0'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -235,7 +235,9 @@ def run(name, row=None, prompt=None, cwd=None, model=None):
         private_dir(ROOT / 'runs')
         marker = ROOT / 'runs' / (str(uuid.uuid4()) + '.json')
         atomic_json(marker, dict(pid=os.getpid(), account=name, session=row['id'] if row else None,
-                                 cwd=str(working), started=time.time()))
+                                 cwd=str(working), started=time.time(), mode='manual',
+                                 phase='CLI open; turn state unknown', model=model,
+                                 title=(row or {}).get('title') or prompt))
         print(f'Account: {name} · Project: {working}', flush=True)
         try:
             return subprocess.call(cmd, env=environment(name), cwd=working)
@@ -292,11 +294,13 @@ def menu():
         login(input('Name your first account (e.g. personal): ').strip(), create=True)
         return 0
     action = pick(['Automatic account routing', 'Start a conversation', 'Resume a conversation', 'Move a conversation',
-                   'Connect another account', 'List accounts'], 'actions', str)
+                   'Connect another account', 'Account status', 'List accounts'], 'actions', str)
     if action == 'Automatic account routing':
         return auto_run()
     elif action == 'Connect another account':
         login(input('Account name: ').strip(), create=True)
+    elif action == 'Account status':
+        return show_status(watch=True)
     elif action == 'Start a conversation':
         return run(choose_account())
     elif action == 'Resume a conversation':
@@ -309,7 +313,7 @@ def menu():
         list_accounts()
     return 0
 
-def account_identity(name, timeout=8):
+def account_snapshot(name, timeout=8, include_usage=False):
     """Ask Codex for cached identity, without refreshing or exposing credentials."""
     with lock('account-' + name, shared=True):
         backend = Backend(name)
@@ -330,15 +334,169 @@ def account_identity(name, timeout=8):
             request(1, 'initialize', {'clientInfo': {'name': 'codex_accounts_identity', 'version': VERSION}})
             backend.send({'method': 'initialized'})
             account = request(2, 'account/read', {'refreshToken': False}).get('account')
+            report = dict(identity=('—', '—', 'needs login'), usage=None, usage_error=None, checked_at=time.time())
             if not account:
-                return ('—', '—', 'needs login')
+                report['usage_error'] = 'No ChatGPT login'
+                return report
             if account.get('type') != 'chatgpt':
-                return ('—', '—', 'not a ChatGPT login')
+                report['identity'] = ('—', '—', 'not a ChatGPT login')
+                report['usage_error'] = 'No ChatGPT login'
+                return report
             def clean(value):
                 return ''.join(c for c in str(value or '—') if c.isprintable())
-            return (clean(account.get('email')), clean(account.get('planType')), 'cached')
+            report['identity'] = (clean(account.get('email')), clean(account.get('planType')), 'cached')
+            if include_usage:
+                try:
+                    report['usage'] = request(3, 'account/rateLimits/read', {})
+                    report['checked_at'] = time.time()
+                except (Error, OSError, ValueError):
+                    report['usage_error'] = 'Could not fetch live limits; check login or connection'
+            return report
         finally:
             backend.close()
+
+def account_identity(name, timeout=8):
+    return account_snapshot(name, timeout=timeout)['identity']
+
+def clean_text(value):
+    return ''.join(c for c in str('—' if value is None or value == '' else value) if c.isprintable())
+
+def duration(seconds):
+    minutes = max(0, int(seconds)) // 60
+    days, minutes = divmod(minutes, 1440)
+    hours, minutes = divmod(minutes, 60)
+    if days: return f'{days}d' + (f' {hours}h' if hours else '')
+    if hours: return f'{hours}h' + (f' {minutes}m' if minutes else '')
+    return f'{minutes}m'
+
+def reset_text(timestamp):
+    if not isinstance(timestamp, (int, float)):
+        return 'reset unknown'
+    local = dt.datetime.fromtimestamp(timestamp).astimezone().strftime('%a %H:%M %Z')
+    if timestamp <= time.time():
+        return f'reset time passed ({local}); refresh to check'
+    return f'resets {local} (in {duration(timestamp - time.time())})'
+
+def usage_lines(usage):
+    if usage is None:
+        return ['Limits unavailable']
+    lines = []
+    allowed = usage.get('ordinaryUsageAllowed')
+    if allowed is False:
+        lines.append('Included usage: blocked by backend')
+    elif allowed is True:
+        lines.append('Included usage: allowed by backend')
+    buckets = usage.get('rateLimitsByLimitId') or {}
+    if not buckets:
+        fallback = usage.get('rateLimits')
+        buckets = {(fallback or {}).get('limitId') or 'codex': fallback} if fallback else {}
+    for key, bucket in buckets.items():
+        if not isinstance(bucket, dict): continue
+        label = clean_text(bucket.get('limitName') or key)
+        for name in ('primary', 'secondary'):
+            window = bucket.get(name)
+            if not isinstance(window, dict): continue
+            used = window.get('usedPercent')
+            mins = window.get('windowDurationMins')
+            window_label = duration(mins * 60) if isinstance(mins, (int, float)) else name
+            if isinstance(used, (int, float)):
+                left = max(0, min(100, 100 - used))
+                blocks = int(left / 10)
+                meter = '[' + '#' * blocks + '-' * (10-blocks) + ']'
+                amount = f'{meter} {left:g}% left ({used:g}% used)'
+            else:
+                amount = 'usage unknown'
+            lines.append(f'{label} · {window_label}: {amount} · {reset_text(window.get("resetsAt"))}')
+        reason = bucket.get('rateLimitReachedType')
+        if reason: lines.append(f'{label}: {clean_text(reason).replace("_", " ")}')
+        if bucket.get('spendControlReached') is True:
+            lines.append(f'{label}: spending limit reached')
+        individual = bucket.get('individualLimit')
+        if individual:
+            remaining = individual.get('remainingPercent')
+            lines.append(f'{label} · spending allowance: {remaining if remaining is not None else "unknown"}% left · '
+                         + reset_text(individual.get('resetsAt')))
+        credits = bucket.get('credits')
+        if isinstance(credits, dict):
+            balance = 'unlimited' if credits.get('unlimited') else clean_text(credits.get('balance'))
+            lines.append(f'{label} · workspace credits: {balance} (may be shared across accounts)')
+    resets = usage.get('rateLimitResetCredits')
+    if isinstance(resets, dict) and resets.get('availableCount') is not None:
+        lines.append(f'Earned resets available: {resets["availableCount"]}')
+    return lines or ['Limits unavailable (backend returned no quota windows)']
+
+def collect_status(account=None):
+    names = [account] if account else accounts()
+    if account: require_account(account)
+    runs = active_runs()
+    routing = read_json(ROOT / 'routing.json', {})
+    def collect(name):
+        report = dict(identity=('—', '—', 'needs login'), usage=None,
+                      usage_error='No cached login', checked_at=time.time())
+        if (require_account(name) / 'auth.json').is_file():
+            try:
+                report = account_snapshot(name, include_usage=True, timeout=12)
+            except (Error, OSError, ValueError):
+                report.update(identity=('—', '—', 'identity unavailable'),
+                              usage_error='Could not read account; check login or connection')
+        report.update(label=name, runs=[r for r in runs if r['account'] == name],
+                      routing=routing.get(name, {}))
+        return report
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max(1, min(4, len(names)))) as pool:
+        return list(pool.map(collect, names))
+
+def render_status(reports):
+    print('CODEX ACCOUNTS · ' + dt.datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z'))
+    if not reports:
+        print('No accounts. Connect one with: codex-accounts add codex1')
+    for report in reports:
+        email, plan, identity_status = report['identity']
+        print(f'\n{report["label"]} · {clean_text(email)} · {clean_text(plan)}')
+        print(f'  Identity: {clean_text(identity_status)} · {len(report["runs"])} launcher session(s) open')
+        cooldown = report['routing'].get('retry_after', 0)
+        if cooldown > time.time():
+            print('  Routing cooldown: retry eligible in ' + duration(cooldown - time.time()))
+        if report.get('usage_error'):
+            print('  Limits unavailable: ' + clean_text(report['usage_error']))
+        else:
+            checked = dt.datetime.fromtimestamp(report['checked_at']).astimezone().strftime('%H:%M:%S %Z')
+            print('  Limits checked ' + checked)
+            for line in usage_lines(report.get('usage')): print('  ' + line)
+        for run in report['runs']:
+            sid = run.get('session') or 'starting / ID not tracked'
+            phase = clean_text(run.get('phase') or 'CLI open; turn state unknown')
+            mode = clean_text(run.get('mode') or 'legacy launcher')
+            print(f'  > {phase} · {mode} · PID {run["pid"]}')
+            print('    Project: ' + clean_text(run.get('cwd')))
+            print('    Conversation: ' + clean_text(sid))
+            if run.get('title'): print('    Title: ' + clean_text(run['title'])[:120])
+            if run.get('model'): print('    Model: ' + clean_text(run['model']))
+            if run.get('started'):
+                print('    Open for ' + duration(time.time() - run['started']))
+    print('\nLocations cover this launcher on this computer, not desktop or ordinary codex sessions.')
+    print('Missing limits mean unknown, not zero usage. Identity is cached; limits are queried live.')
+
+def show_status(account=None, watch=False, interval=30, as_json=False):
+    if watch and (as_json or not sys.stdout.isatty()):
+        raise Error('--watch requires an interactive terminal and cannot be combined with --json.')
+    if interval < 10:
+        raise Error('Refresh interval must be at least 10 seconds.')
+    try:
+        while True:
+            reports = collect_status(account)
+            if watch: print('\033[2J\033[H', end='')
+            if as_json: print(json.dumps(reports, indent=2))
+            else: render_status(reports)
+            if not watch: return 0
+            print(f'\nRefresh every {interval}s · Ctrl-C to close')
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        if watch:
+            print('\nStatus view closed.')
+            return 0
+        raise
+
 
 def list_accounts():
     runs = active_runs()
@@ -367,6 +525,7 @@ def list_accounts():
         email, plan, status = identities[name]
         print(f"{name:<20} {email:<{email_width}}  {plan:<{plan_width}}  {status:<22} {count}{cooldown}")
     print('Email and plan are from cached Codex identity; quota and token validity are not checked.')
+    print('Live limits and session locations: codex-accounts status --watch')
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__, epilog='No command opens the interactive menu.')
@@ -399,8 +558,11 @@ def parser():
     s = sub.add_parser('switch', help='Move a closed conversation to another connected account')
     s.add_argument('session')
     s.add_argument('--to', required=True)
-    s = sub.add_parser('status', help='Ask Codex for the selected account’s login status')
-    s.add_argument('account')
+    s = sub.add_parser('status', help='Live limits and running conversations per account')
+    s.add_argument('account', nargs='?', help='Optional account label; defaults to all accounts')
+    s.add_argument('--watch', action='store_true', help='Refresh in place until Ctrl-C')
+    s.add_argument('--interval', type=int, default=30, help='Watch refresh seconds (minimum 10)')
+    s.add_argument('--json', action='store_true', help='Print a structured snapshot')
     return p
 
 def main(argv=None):
@@ -414,7 +576,7 @@ def main(argv=None):
     elif args.action == 'list':
         list_accounts()
     elif args.action == 'status':
-        return subprocess.call(command('login', 'status'), env=environment(args.account))
+        return show_status(args.account, args.watch, args.interval, args.json)
     elif args.action == 'auto':
         return auto_run(args.account, args.resume, args.cd, args.model, args.prompt)
     elif args.action == 'run':
@@ -598,8 +760,13 @@ class Backend:
         self.logs.close()
 
 class AutoBridge:
-    def __init__(self, name, ws, marker, factory=Backend):
+    def __init__(self, name, ws, marker, factory=Backend, cwd=None):
         self.name, self.ws, self.marker, self.factory = name, ws, marker, factory
+        self.started = time.time()
+        self.cwd = cwd or os.getcwd()
+        self.phase = 'starting'
+        self.title = None
+        self.approvals = set()
         self.backend = None
         self.account_lock = None
         self.session_lock = None
@@ -635,7 +802,9 @@ class AutoBridge:
             self.account_lock = None
     def update_marker(self):
         atomic_json(self.marker, dict(pid=os.getpid(),account=self.name,session=self.sid,
-                                     cwd=os.getcwd(),started=time.time()))
+                                     cwd=self.thread_options.get('cwd') or self.cwd, started=self.started,
+                                     updated=time.time(),mode='auto',phase=self.phase,
+                                     model=self.thread_options.get('model'),title=self.title))
     def set_thread(self, thread):
         sid = thread['id']
         if sid != self.sid:
@@ -646,11 +815,17 @@ class AutoBridge:
             new_lock.__enter__()
             self.session_lock = new_lock
             self.sid = sid
+        self.title = thread.get('name') or thread.get('preview') or self.title
+        self.phase = 'working' if (thread.get('status') or {}).get('type') == 'active' else 'idle'
         for key in ('model','cwd'):
             if thread.get(key): self.thread_options[key] = thread[key]
         self.update_marker()
     def from_client(self, message):
         method, params = message.get('method'), message.get('params', {})
+        if not method and json.dumps(message.get('id')) in self.approvals:
+            self.approvals.discard(json.dumps(message.get('id')))
+            self.phase = 'working'
+            self.update_marker()
         if method == 'initialize':
             self.initialize = params
         if method in ('thread/start','thread/resume'):
@@ -658,6 +833,12 @@ class AutoBridge:
             self.thread_options = {k:v for k,v in params.items() if k in
                 ('model','cwd','approvalPolicy','approvalsReviewer','sandbox','serviceTier','personality','config')}
         if method == 'turn/start':
+            self.phase = 'starting turn'
+            if not self.title:
+                self.title = next((x.get('text') for x in params.get('input', []) if x.get('type') == 'text'), None)
+            for key in ('cwd', 'model'):
+                if params.get(key): self.thread_options[key] = params[key]
+            self.update_marker()
             self.tried = {self.name}
             self.continuation_options = {k:v for k,v in params.items() if k in
                 ('model','cwd','approvalPolicy','approvalsReviewer','sandboxPolicy','effort','summary','serviceTier','personality')}
@@ -666,6 +847,18 @@ class AutoBridge:
         self.backend.send(message)
     def inspect(self, message):
         method, params = message.get('method'), message.get('params', {})
+        if params.get('threadId') == self.sid and self.sid:
+            if method == 'turn/started':
+                self.phase = 'working'
+                self.update_marker()
+            elif method == 'turn/completed':
+                status = (params.get('turn') or {}).get('status')
+                self.phase = 'idle' if status == 'completed' else (status or 'unknown')
+                self.update_marker()
+            elif 'id' in message and method and ('requestApproval' in method or method == 'item/tool/requestUserInput'):
+                self.approvals.add(json.dumps(message['id']))
+                self.phase = 'waiting for input'
+                self.update_marker()
         if method == 'error' and params.get('threadId') == self.sid and not params.get('willRetry', True):
             code = (params.get('error') or {}).get('codexErrorInfo')
             if isinstance(code, str) and code in QUOTA_ERRORS:
@@ -715,6 +908,8 @@ class AutoBridge:
         # Backend has reported the failed turn completed. Stop it before copying
         # history, so no tools or history writers survive on the source account.
         row = choose_session(self.sid)
+        self.phase = 'switching account'
+        self.update_marker()
         self.close_backend()
         self.marker.unlink(missing_ok=True)
         # No in-flight request may be silently abandoned during reconnection.
@@ -793,7 +988,7 @@ def auto_run(account=None, session=None, cwd=None, model=None, prompt=None):
                 raise Error('Codex terminal did not connect within 30 seconds.')
             connected.settimeout(5)
             ws = WebSocket(connected)
-            bridge = AutoBridge(account, ws, marker)
+            bridge = AutoBridge(account, ws, marker, cwd=working)
             while tui.poll() is None:
                 while bridge.backend.messages:
                     bridge.from_backend(bridge.backend.messages.popleft())
