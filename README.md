@@ -237,3 +237,35 @@ python3 scripts/publish_release.py --notes-file /path/to/release-notes.md
 ```
 
 The publisher uploads a standalone CLI, its checksum, and a source archive to a draft release, then publishes it only after all assets are present. Use `--prerelease` for preview releases; automatic updaters ignore previews. Keep CLI/data compatibility so rollback remains possible. The GitHub CLI must be authenticated with permission to publish releases.
+
+## Experimental native Desktop / multi-session router
+
+Version 0.8 adds a persistent local protocol router. Each loaded root chat owns a separate Codex app-server process, account, writer lock, and request queue. A quota failure migrates only that chat's saved history, then resumes its unfinished request on an eligible account. Other chat backends keep running. Disconnecting a client leaves its chats running until the router is stopped. This uses more memory than a single shared backend.
+
+Start the router in a private, short-path directory:
+
+```sh
+codex-accounts serve --socket /tmp/codex-accounts-$UID/router.sock
+```
+
+Optionally add `--account codex2` to prefer that account for new chats. Resume requests retain their current account until a structured quota failure triggers rotation. Eligibility uses cached login presence and shared quota cooldowns; it is not a guarantee of current quota or valid credentials. When all alternatives are exhausted, the chat pauses with an error instead of retrying endlessly. After quota resets, retry the chat. Models and permissions use launcher defaults plus saved/client-selected settings.
+
+Connect an independent protocol client using the native CLI:
+
+```sh
+codex app-server proxy --sock /tmp/codex-accounts-$UID/router.sock
+```
+
+Native terminal clients can connect with `codex --remote unix:///tmp/codex-accounts-$UID/router.sock`. The socket accepts both native newline-JSON proxy traffic and WebSockets, and is accessible only to your OS user. Do not expose it over a public network.
+
+For Desktop, the SSH host's Codex entry point must forward its app-server/proxy requests to this socket. Merely adding an ordinary SSH host does **not** enable rotation. The local SSH adapter remains an experimental setup, not a packaged one-click installer. Existing Desktop connections need reconnecting to use a changed adapter; do so between turns. Do not replace a live native daemon or its socket. Use `codex-accounts overview --history` to see account assignments and moves.
+
+The native account indicator describes the router's primary control account, not every chat's execution account or combined quota. Manage authentication with `codex-accounts add/login`; authentication changes from connected protocol clients are rejected. Chat history lists combine connected accounts and deduplicate moved histories. Pending approval request IDs are isolated between backends and replayed after reconnect. Settings/plugins that are not thread-scoped still belong to the primary account's backend; full Desktop plugin/browser/automation parity has not been verified.
+
+Validation includes native proxy connections, two chats, client reconnect, combined history, and an injected quota failure that migrates history through real Codex backends while another chat remains accessible. The injection sends no model request. Actual quota exhaustion and seamless native Desktop UI recovery after rotation still require a live test. Automatic continuation is a new turn and does not guarantee exactly-once tool side effects.
+
+Stopping `serve` stops its managed backends and tools. Saved histories and account assignments remain available for a later start. This release does not install a launch-at-login service. Run the optional compatibility test after upgrading Codex:
+
+```sh
+python3 test_native_router.py
+```

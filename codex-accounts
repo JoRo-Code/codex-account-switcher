@@ -19,7 +19,7 @@ import textwrap
 import uuid
 import unicodedata
 
-VERSION = '0.7.1'
+VERSION = '0.8.0'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -366,7 +366,7 @@ def reset_history_projection(home, sid):
     finally:
         db.close()
 
-def move(row, target, already_locked=False, source_home=None):
+def move(row, target, already_locked=False, source_home=None, quiet=False):
     require_account(target)
     if row['account'] == target and source_home is None:
         raise Error('This conversation already uses that account.')
@@ -428,8 +428,9 @@ def move(row, target, already_locked=False, source_home=None):
         record_activity(row['id'], target, 'imported' if external else ('auto_switched' if already_locked else 'moved'),
                         cwd=row.get('cwd'), title=row.get('title'),
                         previous='local (account unknown)' if external else row['account'])
-    print(f"Moved {row['id']} from {row['account']} to {target}.")
-    print('Original history retained. Continue with: codex-accounts resume ' + row['id'])
+    if not quiet:
+        print(f"Moved {row['id']} from {row['account']} to {target}.")
+        print('Original history retained. Continue with: codex-accounts resume ' + row['id'])
 
 def local_chats(source_home=None):
     home = Path(source_home or os.environ.get('CODEX_ACCOUNTS_SOURCE_HOME', str(Path.home()/'.codex'))).expanduser().resolve()
@@ -1185,6 +1186,9 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__, epilog='No command opens the interactive menu.')
     p.add_argument('--version', action='version', version=VERSION)
     sub = p.add_subparsers(dest='action')
+    s = sub.add_parser('serve', help='Persistent multi-session account router (experimental)')
+    s.add_argument('--socket', required=True)
+    s.add_argument('--account', help='Preferred account for new chats')
     s = sub.add_parser('overview', help='Conversations, accounts, active sessions, and recorded account history')
     s.add_argument('query', nargs='*', help='Filter by title, project, or session ID')
     s.add_argument('--account', help='Include chats currently or historically recorded under this label')
@@ -1249,6 +1253,8 @@ def main(argv=None):
     args = parser().parse_args(argv)
     os.umask(0o077)
     private_dir(ROOT)
+    if args.action == 'serve':
+        return serve_router(args.socket, args.account)
     if args.action == 'permissions':
         permissions(args.mode)
         return 0
@@ -1638,8 +1644,7 @@ class AutoBridge:
         self.pending.clear()
         self.pending_thread_options.clear()
         # The bridge already owns this conversation's exclusive lock.
-        with contextlib.redirect_stdout(io.StringIO()):
-            move(row, target, already_locked=True)
+        move(row, target, already_locked=True, quiet=True)
         self.open_backend(target)
         self.rpc('initialize', self.initialize)
         self.backend.send(dict(method='initialized'))
@@ -1751,6 +1756,371 @@ def auto_run(account=None, session=None, cwd=None, model=None, prompt=None):
             signal.signal(signal.SIGINT, previous_sigint)
             if bridge:
                 auto_exit_message(bridge.sid or (row and row['id']))
+
+
+# The persistent router isolates each root conversation in its own backend.
+# A lane is an actor: only its worker touches AutoBridge/backend state.
+import queue
+import threading
+from concurrent.futures import Future
+
+class RouterLane:
+    def __init__(self, router, account, initialize, control=False):
+        self.router, self.control = router, control
+        self.inbox = queue.Queue(maxsize=1024)
+        self.ready = Future()
+        self.stopped = threading.Event()
+        self.generation = 0
+        self.bridge = None
+        self.thread = threading.Thread(target=self.run, args=(account, initialize), daemon=True)
+        self.thread.start()
+
+    def send(self, message):
+        self.router.output(self, message)
+
+    def submit(self, message):
+        if self.stopped.is_set(): raise Error('Conversation backend stopped; reconnect to resume saved history.')
+        try: self.inbox.put_nowait(('send', message, None))
+        except queue.Full: raise Error('Conversation request queue is full; retry shortly.')
+
+    def call(self, method, params):
+        result = Future()
+        if self.stopped.is_set(): raise Error('Backend stopped.')
+        self.inbox.put(('rpc', (method, params), result), timeout=5)
+        return result.result(timeout=45)
+
+    def run(self, account, initialize):
+        lane = self
+        class Bridge(AutoBridge):
+            def update_marker(self):
+                if self.sid and not lane.control: super().update_marker()
+            def open_backend(self, name):
+                lane.generation += 1
+                super().open_backend(name)
+            def set_thread(self, thread):
+                if lane.control or thread.get('ephemeral'): return
+                # Descendant/helper responses must not replace the root actor.
+                if self.sid and thread['id'] != self.sid: return
+                super().set_thread(thread)
+            def failover(self, info):
+                # Track quota even if no alternative is currently eligible.
+                try: super().failover(info)
+                except (Error, OSError, ValueError, sqlite3.Error) as exc:
+                    self.phase = 'switch failed'
+                    self.update_marker()
+                    lane.router.notice(self.sid, 'Account switch failed: '+str(exc))
+                if self.phase == 'failed':
+                    self.phase = 'waiting for quota'
+                    self.update_marker()
+                    lane.router.notice(self.sid, 'No other account is ready. Resume after an account reset or add another account.')
+        try:
+            marker = ROOT/'runs'/('router-'+str(uuid.uuid4())+'.json')
+            self.bridge = Bridge(account, self, marker, factory=self.router.factory)
+            self.bridge.initialize = initialize
+            response = self.bridge.rpc('initialize', initialize)
+            self.bridge.backend.send({'method':'initialized'})
+            self.ready.set_result(response)
+            while not self.stopped.is_set():
+                try:
+                    kind, value, future = self.inbox.get(timeout=.02)
+                except queue.Empty:
+                    kind = None
+                if kind == 'rpc':
+                    try: future.set_result(self.bridge.rpc(*value))
+                    except Exception as exc: future.set_exception(exc)
+                elif kind == 'send':
+                    self.bridge.from_client(value)
+                while self.bridge.backend.messages:
+                    self.bridge.from_backend(self.bridge.backend.messages.popleft())
+                if select.select([self.bridge.backend.process.stdout], [], [], .02)[0]:
+                    self.bridge.backend.read()
+        except Exception as exc:
+            if not self.ready.done(): self.ready.set_exception(exc)
+            self.router.lane_failed(self, str(exc))
+        finally:
+            self.stopped.set()
+            if self.bridge: self.bridge.close()
+            while not self.inbox.empty():
+                _, _, future = self.inbox.get_nowait()
+                if future and not future.done(): future.set_exception(Error('Backend stopped.'))
+
+    def close(self):
+        self.stopped.set()
+        self.thread.join(timeout=40)
+
+class MultiRouter:
+    def __init__(self, preferred=None, factory=Backend):
+        self.preferred, self.factory = preferred, factory
+        self.mutex = threading.RLock()
+        self.clients = set()
+        self.lanes = set()
+        self.sessions = {}
+        self.controls = {}
+        self.primary = None
+        self.requests = {}
+        self.approvals = {}
+        self.pages = {}
+        self.initialize = None
+        self.closed = False
+
+    def available(self):
+        choices = eligible_accounts()
+        if self.preferred in choices:
+            choices.remove(self.preferred)
+            choices.insert(0, self.preferred)
+        if not choices: raise Error('No accounts are ready. Add an account or wait for quota to reset.')
+        return choices
+
+    def lane(self, account, control=False):
+        if self.closed: raise Error('Router is shutting down.')
+        lane = RouterLane(self, account, self.initialize, control)
+        self.lanes.add(lane)
+        return lane
+
+    def control(self, account=None):
+        name = account or self.primary or self.available()[0]
+        if self.primary is None: self.primary = name
+        old = self.controls.get(name)
+        if old is None or old.stopped.is_set():
+            self.controls[name] = self.lane(name, control=True)
+        return self.controls[name]
+
+    def reply(self, client, message):
+        try: client.send(message)
+        except (OSError, EOFError): self.clients.discard(client)
+
+    def notice(self, sid, text):
+        # Standard error notification, scoped to the affected conversation.
+        with self.mutex:
+            for client in list(self.clients):
+                self.reply(client, {'method':'error','params':{'threadId':sid, 'willRetry':False,
+                    'error':{'message':text,'codexErrorInfo':None,'additionalDetails':None}}})
+
+    def output(self, lane, message):
+        with self.mutex:
+            for key, approval in list(self.approvals.items()):
+                if approval[0] is lane and approval[2] != lane.generation:
+                    del self.approvals[key]
+            message = dict(message)
+            method = message.get('method')
+            if 'id' in message and not method:
+                pending = self.requests.pop(message['id'], None)
+                if pending is None: return
+                client, original, owner, requested = pending
+                thread = (message.get('result') or {}).get('thread')
+                if thread and not lane.control and requested in ('thread/start','thread/resume','thread/fork'):
+                    self.sessions[thread['id']] = lane
+                message['id'] = original
+                if client in self.clients: self.reply(client, message)
+                return
+            params = message.get('params') or {}
+            if not lane.control and method == 'thread/started' and params.get('thread'):
+                self.sessions[params['thread']['id']] = lane
+            if method and method.startswith('account/') and (not lane.control or lane is not self.controls.get(self.primary)):
+                return  # A per-chat switch is not a global Desktop login change.
+            if 'id' in message and method:
+                original = message['id']
+                message['id'] = 'router-approval-'+str(uuid.uuid4())
+                self.approvals[message['id']] = (lane, original, lane.generation, message)
+            for client in list(self.clients): self.reply(client, message)
+
+    def lane_failed(self, lane, reason):
+        with self.mutex:
+            for ident, pending in list(self.requests.items()):
+                client, original, owner, _ = pending
+                if owner is lane:
+                    self.reply(client, {'id':original,'error':{'code':-32000,'message':reason}})
+                    del self.requests[ident]
+            for ident, pending in list(self.approvals.items()):
+                if pending[0] is lane: del self.approvals[ident]
+            for sid, owner in list(self.sessions.items()):
+                if owner is lane: del self.sessions[sid]
+
+    def disconnect(self, client):
+        with self.mutex:
+            self.clients.discard(client)
+            # Keep actors alive; replies to departed clients are dropped.
+            for ident, pending in list(self.requests.items()):
+                if pending[0] is client:
+                    self.requests[ident] = (None, *pending[1:])
+
+    def route(self, client, message):
+        if self.closed: raise Error('Router is shutting down.')
+        method, params = message.get('method'), message.get('params') or {}
+        ident = message.get('id')
+        if method == 'initialize':
+            with self.mutex:
+                if self.initialize is None: self.initialize = params
+                self.clients.add(client)
+                lane = self.control()
+            response = lane.ready.result(timeout=35)
+            with self.mutex:
+                self.reply(client, {'id':ident,'result':response})
+            return
+        if method == 'initialized':
+            with self.mutex:
+                for lane, original, generation, pending in self.approvals.values():
+                    if generation == lane.generation: self.reply(client, pending)
+            return
+        if client not in self.clients: raise Error('Initialize this connection first.')
+        if not method:
+            with self.mutex:
+                pending = self.approvals.pop(ident, None)
+                if pending:
+                    lane, original, generation, _ = pending
+                    if generation == lane.generation: lane.submit(dict(message, id=original))
+            return
+        if method in ('account/login/start','account/logout','account/login/cancel'):
+            raise Error('Manage router accounts with codex-accounts add/login; Desktop cannot replace the shared account registry.')
+        if method == 'thread/list':
+            response = self.thread_list(params)
+            with self.mutex: self.reply(client, {'id':ident,'result':response})
+            return
+        if method == 'thread/loaded/list':
+            with self.mutex:
+                ids = [sid for sid,lane in self.sessions.items() if not lane.stopped.is_set()]
+                self.reply(client, {'id':ident,'result':{'data':ids}})
+            return
+        with self.mutex:
+            sid = params.get('threadId')
+            lane = self.sessions.get(sid)
+            if lane and lane.stopped.is_set(): lane = None
+            if method == 'thread/start' or (method == 'thread/fork' and not params.get('ephemeral')):
+                account = choose_session(sid)['account'] if sid else self.available()[0]
+                lane = self.lane(account)
+            elif sid and lane is None:
+                row = choose_session(sid)
+                if method == 'thread/resume':
+                    lane = self.lane(row['account'])
+                    self.sessions[sid] = lane
+                elif method.startswith('turn/') or method == 'thread/compact/start':
+                    raise Error('Resume this conversation before starting or steering a turn.')
+                else:
+                    # Metadata/history operations must not acquire a writer or
+                    # turn an unloaded conversation into an active session.
+                    lane = self.control(row['account'])
+            elif lane is None:
+                lane = self.control()
+            routed = dict(message)
+            if 'id' in message:
+                routed['id'] = 'router-request-'+str(uuid.uuid4())
+                self.requests[routed['id']] = (client, ident, lane, method)
+            try: lane.submit(routed)
+            except Exception:
+                self.requests.pop(routed.get('id'), None)
+                raise
+
+    def thread_list(self, params):
+        cursor = params.get('cursor')
+        limit = params.get('limit') or 25
+        if not isinstance(limit,int) or not 1 <= limit <= 1000: raise Error('Invalid thread list limit.')
+        with self.mutex:
+            now = time.monotonic()
+            self.pages = {k:v for k,v in self.pages.items() if v[0]>now}
+            if cursor:
+                stored = self.pages.pop(cursor, None)
+                if stored is None: raise Error('History cursor expired; reload the first page.')
+                rows = stored[1]
+            else: rows = None
+        if rows is None:
+            found = {}
+            ownership = owners()
+            for account in accounts():
+                if not (require_account(account)/'auth.json').is_file(): continue
+                with self.mutex: lane = self.control(account)
+                query = dict(params, cursor=None, limit=100)
+                while True:
+                    result = lane.call('thread/list', query)
+                    for row in result.get('data',[]):
+                        sid = row['id']
+                        if sid in ownership and ownership[sid] != account: continue
+                        if sid not in found or ownership.get(sid)==account: found[sid]=row
+                    cursor = result.get('nextCursor')
+                    if not cursor: break
+                    if len(found)>10000: raise Error('Narrow your history search to fewer than 10000 chats.')
+                    query['cursor']=cursor
+            key = {'created_at':'createdAt','updated_at':'updatedAt','recency_at':'updatedAt'}.get(params.get('sortKey'),'createdAt')
+            rows = sorted(found.values(), key=lambda r:(r.get(key,0),r['id']),reverse=params.get('sortDirection')!='asc')
+        next_cursor = None
+        if len(rows)>limit:
+            next_cursor='router-page-'+str(uuid.uuid4())
+            with self.mutex:
+                if len(self.pages)>=128: self.pages.pop(next(iter(self.pages)))
+                self.pages[next_cursor]=(time.monotonic()+120,rows[limit:])
+        return {'data':rows[:limit],'nextCursor':next_cursor}
+
+    def close(self):
+        with self.mutex:
+            self.closed = True
+            lanes = list(self.lanes)
+            for lane in lanes: lane.stopped.set()
+        for lane in lanes: lane.close()
+
+class JsonSocket:
+    """Native app-server proxy uses newline JSON on its control socket."""
+    def __init__(self, sock):
+        self.sock, self.buffer = sock, bytearray()
+    def send(self, message):
+        self.sock.sendall((json.dumps(message)+'\n').encode())
+    def read(self):
+        data=self.sock.recv(65536)
+        if not data: raise EOFError
+        self.buffer.extend(data)
+        if len(self.buffer)>64*1024*1024: raise Error('Oversized protocol message.')
+        result=[]
+        while b'\n' in self.buffer:
+            line,_,rest=self.buffer.partition(b'\n');self.buffer[:]=rest
+            if line.strip(): result.append(json.loads(line))
+        return result
+
+class RouterClient:
+    def __init__(self, ws):
+        self.ws, self.mutex = ws, threading.Lock()
+    def send(self, message):
+        with self.mutex: self.ws.send(message)
+
+def serve_router(address, preferred=None):
+    path=Path(address).expanduser().resolve()
+    if len(str(path).encode())>100: raise Error('Use a shorter Unix socket path (under 100 bytes).')
+    if path.exists(): raise Error('Socket path already exists; stop its owner before replacing it.')
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = path.parent.stat()
+    if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise Error('Socket parent must be a private directory owned by you (mode 700).')
+    private_dir(ROOT/'runs')
+    router=MultiRouter(preferred)
+    listener=socket.socket(socket.AF_UNIX)
+    clients=[]
+    stopping=threading.Event()
+    def connected(sock):
+        client=None
+        try:
+            sock.settimeout(5)
+            client=RouterClient(WebSocket(sock) if sock.recv(1,socket.MSG_PEEK)==b'G' else JsonSocket(sock))
+            while not stopping.is_set():
+                if not select.select([sock],[],[],.25)[0]: continue
+                for message in client.ws.read():
+                    try: router.route(client,message)
+                    except Exception as exc:
+                        if 'id' in message:
+                            client.send({'id':message['id'],'error':{'code':-32000,'message':str(exc)}})
+        except (EOFError,OSError,Error,ValueError): pass
+        finally:
+            if client: router.disconnect(client)
+            sock.close()
+    previous={s:signal.signal(s,lambda *_:stopping.set()) for s in (signal.SIGTERM,signal.SIGINT)}
+    try:
+        listener.bind(str(path));path.chmod(0o600);listener.listen(16);listener.settimeout(.25)
+        print('Multi-session router listening on '+str(path),file=sys.stderr,flush=True)
+        while not stopping.is_set():
+            try: sock,_=listener.accept()
+            except socket.timeout: continue
+            thread=threading.Thread(target=connected,args=(sock,),daemon=True)
+            clients.append(thread);thread.start()
+    finally:
+        stopping.set();listener.close();router.close();path.unlink(missing_ok=True)
+        for s,handler in previous.items():signal.signal(s,handler)
+    return 0
 
 
 if __name__ == '__main__':
