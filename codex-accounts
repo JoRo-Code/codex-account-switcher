@@ -17,7 +17,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = '0.5.0'
+VERSION = '0.6.0'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -171,6 +171,12 @@ def session_title(path):
             try:
                 item = json.loads(line)
                 payload = item.get('payload', {})
+                if item.get('type') == 'event_msg' and payload.get('type') == 'item_completed':
+                    message = payload.get('item') or {}
+                    if message.get('type') == 'UserMessage':
+                        value = ' '.join(x.get('text', '') for x in message.get('content', []) if x.get('type') == 'text')
+                        if value.strip() and not value.lstrip().startswith('<'):
+                            return clean_text(' '.join(value.split()))[:90]
                 if item.get('type') == 'event_msg' and payload.get('type') == 'user_message':
                     value = payload.get('message', '')
                     if isinstance(value, str) and value.strip() and not value.lstrip().startswith('<'):
@@ -335,22 +341,28 @@ def reset_history_projection(home, sid):
     finally:
         db.close()
 
-def move(row, target, already_locked=False):
+def move(row, target, already_locked=False, source_home=None):
     require_account(target)
-    if row['account'] == target:
+    if row['account'] == target and source_home is None:
         raise Error('This conversation already uses that account.')
     if row['history_mode'] not in ('legacy', 'paginated'):
         raise Error('Unknown history format; no files were changed.')
     if not (require_account(target) / 'auth.json').is_file():
         raise Error('Connect the destination first: codex-accounts login ' + target)
-    with lock('account-' + row['account'], shared=True), lock('account-' + target, shared=True), \
+    external = source_home is not None
+    source_home = Path(source_home).resolve() if external else require_account(row['account'])
+    source_lock = ('source-' + hashlib.sha256(str(source_home).encode()).hexdigest()[:24]
+                   if external else 'account-' + row['account'])
+    with lock(source_lock, shared=True), lock('account-' + target, shared=True), \
             (contextlib.nullcontext() if already_locked else lock('session-' + row['id'])), lock('registry'), \
-            history_writer_lock(require_account(row['account']), row['id']), \
+            history_writer_lock(source_home, row['id']), \
             history_writer_lock(require_account(target), row['id']):
         guard_idle(row)
         if owners().get(row['id'], row['account']) != row['account']:
             raise Error('Conversation changed accounts; retry with its current location.')
         source = Path(row['path'])
+        if not source.resolve().is_relative_to((source_home / 'sessions').resolve()):
+            raise Error('History path is outside the source session directory.')
         existing = list((require_account(target) / 'sessions').rglob('*' + row['id'] + '.jsonl'))
         if len(existing) > 1:
             raise Error('Destination contains duplicate session histories; no files were changed.')
@@ -391,15 +403,124 @@ def move(row, target, already_locked=False):
     print(f"Moved {row['id']} from {row['account']} to {target}.")
     print('Original history retained. Continue with: codex-accounts resume ' + row['id'])
 
+def local_chats(source_home=None):
+    home = Path(source_home or os.environ.get('CODEX_ACCOUNTS_SOURCE_HOME', str(Path.home()/'.codex'))).expanduser().resolve()
+    titles = {}
+    database = home / 'state_5.sqlite'
+    if database.exists():
+        try:
+            with contextlib.closing(sqlite3.connect(database.as_uri()+'?mode=ro', uri=True)) as db:
+                columns = {r[1] for r in db.execute('PRAGMA table_info(threads)')}
+                title_column = "COALESCE(NULLIF(name, ''), title)" if 'name' in columns else 'title'
+                for sid, title, cwd in db.execute('SELECT id, '+title_column+', cwd FROM threads WHERE archived = 0'):
+                    titles[sid] = (title, cwd)
+        except sqlite3.Error:
+            pass  # Rollout discovery works without the optional title index.
+    result = []
+    for path in (home/'sessions').rglob('*.jsonl'):
+        try:
+            if not path.resolve().is_relative_to((home/'sessions').resolve()): continue
+            with path.open() as f: record = json.loads(f.readline(1024*1024))
+            if record.get('type') != 'session_meta': continue
+            meta = record['payload']
+            if isinstance(meta.get('source'), dict): continue  # Child-agent histories are not standalone chats.
+            sid = str(uuid.UUID(meta['id']))
+            title, cwd = titles.get(sid, (None, None))
+            result.append(dict(id=sid, account='local', source_home=str(home),
+                               title=clean_text(title or session_title(path)), cwd=cwd or meta.get('cwd',''),
+                               history_mode=meta.get('history_mode','legacy'),
+                               path=str(path), modified=path.stat().st_mtime))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return result
+
+def discover_chats(query='', source_home=None):
+    managed = session_records()
+    ids = {row['id'] for row in managed}
+    rows = managed + [row for row in local_chats(source_home) if row['id'] not in ids]
+    words = query.casefold().split()
+    rows = [r for r in rows if all(word in (' '.join(str(r[k]) for k in ('id','title','cwd','account'))).casefold() for word in words)]
+    return sorted(rows, key=lambda r:r['modified'], reverse=True)
+
+def chat_description(row):
+    source = 'Local Codex / Desktop (import)' if row.get('source_home') else row['account'] + ' (launcher)'
+    when = dt.datetime.fromtimestamp(row['modified']).strftime('%m-%d %H:%M')
+    return f"{clean_text(row['title'])[:100]} · {when}\n     {clean_text(row['cwd'])} · {source}"
+
+def pick_chat(rows):
+    if not rows: raise Error('No matching local chats found. Try a different search or --source-home.')
+    if not sys.stdin.isatty(): raise Error('Use continue --list to browse, then continue CHAT_ID in a terminal.')
+    original, page = rows, 0
+    while True:
+        shown = rows[page*15:(page+1)*15]
+        print(f'\nExisting chats · {len(rows)} matches · page {page+1}')
+        for i,row in enumerate(shown,1): print(f'{i:>2}. {chat_description(row)}')
+        value = input('Number to continue · text to filter · n next · / reset · Enter cancel: ').strip()
+        if not value: raise Error('Cancelled.')
+        if value == 'n': page = (page+1) % max(1,(len(rows)+14)//15); continue
+        if value == '/': rows,page = original,0; continue
+        if value.isdigit() and 1 <= int(value) <= len(shown): return shown[int(value)-1]
+        words = value.casefold().split()
+        rows = [r for r in original if all(w in (r['title']+' '+r['cwd']+' '+r['account']).casefold() for w in words)]
+        page = 0
+
+def quota_state(report):
+    usage = report.get('usage') or {}
+    if usage.get('ordinaryUsageAllowed') is False: return 'blocked'
+    if usage.get('ordinaryUsageAllowed') is True: return 'available'
+    return 'unknown'
+
+def select_ready_account(reports, preferred=None, requested=None):
+    if requested:
+        matches = [r for r in reports if r['label'] == requested]
+        if not matches: raise Error('Unknown account: ' + requested)
+        if quota_state(matches[0]) == 'blocked': raise Error('That account is blocked by its live usage limits. Choose another account.')
+        if matches[0]['identity'][2] != 'cached': raise Error('Reconnect this account with codex-accounts login ' + requested)
+        return matches[0]
+    available = [r for r in reports if quota_state(r) == 'available']
+    if not available:
+        raise Error('No account has confirmed available quota. Check codex-accounts status; use --account NAME explicitly if limits are unavailable.')
+    return min(available, key=lambda r:(r['label'] != preferred, len(r.get('runs',[])), r.get('routing',{}).get('last_selected',0)))
+
+def continue_chat(query='', account=None, source_home=None, list_only=False, as_json=False):
+    rows = discover_chats(query, source_home)
+    if list_only or as_json:
+        if as_json: print(json.dumps(rows, indent=2))
+        else:
+            for row in rows: print(chat_description(row)+'\n     '+row['id'])
+            if not rows: print('No matching local chats found.')
+        return 0
+    if not sys.stdin.isatty(): raise Error('Continue needs a terminal. Use --list or --json to inspect chats.')
+    row = rows[0] if query and len(rows) == 1 else pick_chat(rows)
+    if not Path(row['cwd']).is_dir(): raise Error('The chat’s project directory is missing: '+clean_text(row['cwd']))
+    print('Checking connected accounts and live limits…', flush=True)
+    reports = collect_status()
+    selected = select_ready_account(reports, None if row.get('source_home') else row['account'], account)
+    name = selected['label']
+    print(f"Account: {name} · {selected['identity'][0]} · {quota_state(selected)}")
+    for line in usage_lines(selected.get('usage'))[:2]: print('  '+line)
+    if row.get('source_home'):
+        print('Continuing a copy in the terminal. The original Desktop/local chat stays separate; later messages do not sync.')
+        move(row, name, source_home=row['source_home'])
+    elif row['account'] != name:
+        move(row, name)
+    print('Automatic account switching: ON for this terminal chat.', flush=True)
+    # A current successful quota check supersedes a stale launcher cooldown.
+    if quota_state(selected) == 'available':
+        with routing_state() as state: state.setdefault(name,{})['retry_after'] = 0
+    return auto_run(account=name, session=row['id'])
+
 def menu():
     if not accounts():
         if not sys.stdin.isatty():
             raise Error('Connect your first account: codex-accounts add personal')
         login(input('Name your first account (e.g. personal): ').strip(), create=True)
         return 0
-    action = pick(['Automatic account routing', 'Start a conversation', 'Resume a conversation', 'Move a conversation',
+    action = pick(['Continue an existing chat', 'Automatic account routing', 'Start a conversation', 'Resume a conversation', 'Move a conversation',
                    'Connect another account', 'Account status', 'List accounts'], 'actions', str)
-    if action == 'Automatic account routing':
+    if action == 'Continue an existing chat':
+        return continue_chat()
+    elif action == 'Automatic account routing':
         return auto_run()
     elif action == 'Connect another account':
         login(input('Account name: ').strip(), create=True)
@@ -834,6 +955,12 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__, epilog='No command opens the interactive menu.')
     p.add_argument('--version', action='version', version=VERSION)
     sub = p.add_subparsers(dest='action')
+    s = sub.add_parser('continue', help='Find and continue an existing local or launcher chat')
+    s.add_argument('query', nargs='*', help='Search by chat title, project, or ID')
+    s.add_argument('--account', help='Choose an account explicitly instead of live quota selection')
+    s.add_argument('--source-home', help='Existing Codex home to search (default: ~/.codex)')
+    s.add_argument('--list', action='store_true', help='List matching chats without starting or importing')
+    s.add_argument('--json', action='store_true', help='List matching chats as JSON without changes')
     s = sub.add_parser('permissions', help='Shared permissions for all launcher accounts')
     s.add_argument('mode', nargs='?', choices=['default', 'yolo'])
     s = sub.add_parser('defaults', help='Shared model defaults for all launcher accounts')
@@ -913,6 +1040,8 @@ def main(argv=None):
         return show_status(args.account, args.watch, args.interval, args.json)
     elif args.action == 'auto':
         return auto_run(args.account, args.resume, args.cd, args.model, args.prompt)
+    elif args.action == 'continue':
+        return continue_chat(' '.join(args.query), args.account, args.source_home, args.list, args.json)
     elif args.action == 'run':
         return run(choose_account(args.account), prompt=args.prompt, cwd=args.cd, model=args.model)
     elif args.action == 'sessions':
@@ -1289,8 +1418,13 @@ def auto_run(account=None, session=None, cwd=None, model=None, prompt=None):
     if not sys.stdin.isatty():
         raise Error('Automatic mode uses the native interactive Codex terminal; run it in a terminal.')
     row = choose_session(session) if session else None
+    requested_account = account
     if row:
         account = row['account']
+        if requested_account and requested_account != account:
+            move(row, requested_account)
+            account = requested_account
+            row = choose_session(session)
     choices = eligible_accounts()
     if not account:
         if not choices:
@@ -1299,7 +1433,7 @@ def auto_run(account=None, session=None, cwd=None, model=None, prompt=None):
     require_account(account)
     if not (require_account(account) / 'auth.json').is_file():
         raise Error('Connect this account first: codex-accounts login ' + account)
-    if row and account not in choices and choices:
+    if row and not requested_account and account not in choices and choices:
         move(row, choices[0])
         account = choices[0]
         row = choose_session(session)

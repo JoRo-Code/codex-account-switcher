@@ -96,7 +96,9 @@ with tempfile.TemporaryDirectory() as tmp:
         initialize(); hydrate(1)
     finally: stop()
     # Destination starts with no index. Codex must rebuild it from the copied log.
-    with contextlib.redirect_stdout(io.StringIO()): app.move(app.choose_session(sid), 'b')
+    local_row = app.local_chats(app.account_home('a'))[0]
+    with contextlib.redirect_stdout(io.StringIO()):
+        app.move(local_row, 'b', source_home=app.account_home('a'))
     auth.unlink()
     env = app.environment('b')
     proc = subprocess.Popen(['codex','app-server'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,

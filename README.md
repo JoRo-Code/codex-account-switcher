@@ -4,6 +4,26 @@ A local launcher for multiple ChatGPT accounts in Codex CLI. Automatic mode keep
 
 > **Experimental:** simulated failover and offline compatibility checks pass. Live quota failover has not yet been validated.
 
+## Continue a chat you already have
+
+```sh
+codex-accounts continue
+```
+
+Choose a chat by title and project. Type text to filter the list, a number to continue, or `n` for the next page. The picker includes launcher chats and locally saved chats in `~/.codex`, including local Desktop and ordinary CLI chats. It checks live limits, keeps the current account when available, and selects another account when the current one is blocked. Before opening the terminal it shows the account email, quota, and automatic-switching status.
+
+```sh
+codex-accounts continue billing          # Search by title or project
+codex-accounts continue --list           # Browse without starting anything
+codex-accounts continue billing --account codex2
+```
+
+An existing local chat is imported as a separate terminal copy. Its original stays in Desktop or the ordinary CLI; later messages do not sync between copies. After import the picker prefers the launcher copy so it does not repeatedly import the original. Stop/close the original session before importing; Codex's native writer lock may prevent import while the original remains loaded. Credentials, plugins, and account configuration are not copied. Launcher defaults and the chat's saved settings apply as described below.
+
+This does **not** switch the account of an in-place Desktop chat. Desktop account switching and a menu-bar account picker are not implemented or verified. Cloud-only ChatGPT chats are not imported. The supported automatic switching occurs in the launcher terminal.
+
+If limits cannot be verified, the launcher asks you to check status or choose `--account NAME` explicitly instead of silently treating an unknown account as available. Known blocked accounts are rejected. `--source-home PATH` searches another existing Codex home; `--json` lists matches without starting or importing a chat.
+
 ## Install
 
 Requires macOS or Linux, Python 3.9+, and a Codex CLI supporting `--remote unix://` and the app-server protocol (transport and paginated migration checked against installed Codex 0.159.2). Manual mode also uses `--no-daemon`. Automatic mode depends on an experimental Codex interface, so rerun the tests after CLI upgrades.
@@ -178,6 +198,7 @@ python3 test_status.py
 python3 test_update.py
 python3 test_native_history.py
 python3 test_native_paginated_history.py
+python3 test_continue.py
 ```
 
 Tests cover isolated credentials/environment, concurrent account locks, duplicate-resume protection, active-session move protection, complete history preservation and round trips, unsupported-format rejection, argument forwarding, and account-name validation. The paginated native check verifies A → B → A migration with a stale destination index, two preserved turns, pagination, and native writer locks. The legacy offline native check verifies that the installed Codex app server discovers the moved history and reads its user and assistant messages, without making a model request. Additional tests simulate quota failover, exhaustion of all accounts, concurrent-session routing, cooldowns, preservation of model/approval settings, isolation of subagent events, pending RPC handling, and WebSocket framing. The real native terminal was also connected through the bridge up to its authentication check. Live identity and quota retrieval have been checked with connected accounts. Model requests and real quota failover are not exercised by the tests. Automatic failover is implemented but has not yet been validated against a live account quota failure.
