@@ -60,6 +60,24 @@ class AutoTests(unittest.TestCase):
         self.assertIn('do not repeat completed side effects',calls['turn/start']['input'][0]['text'])
         self.assertNotIn('personal', app.eligible_accounts())
 
+    def test_failover_preserves_full_access_and_model_choices(self):
+        bridge = self.make_bridge()
+        bridge.from_client({'id': 1, 'method': 'thread/resume', 'params': {
+            'threadId': self.sid, 'model': 'chosen-model', 'approvalPolicy': 'never',
+            'sandbox': 'danger-full-access'}})
+        bridge.from_client({'id': 2, 'method': 'turn/start', 'params': {
+            'threadId': self.sid, 'model': 'chosen-model', 'effort': 'high',
+            'approvalPolicy': 'never', 'sandboxPolicy': {'type': 'dangerFullAccess'},
+            'input': [{'type': 'text', 'text': 'Continue'}]}})
+        with patch.object(bridge, 'rpc', side_effect=self.fake_rpc) as rpc:
+            bridge.from_backend(self.completion())
+        calls = {call.args[0]: call.args[1] for call in rpc.call_args_list}
+        self.assertEqual(calls['thread/resume']['sandbox'], 'danger-full-access')
+        self.assertEqual(calls['turn/start']['sandboxPolicy'], {'type': 'dangerFullAccess'})
+        self.assertEqual(calls['turn/start']['approvalPolicy'], 'never')
+        self.assertEqual(calls['turn/start']['model'], 'chosen-model')
+        self.assertEqual(calls['turn/start']['effort'], 'high')
+
     def test_all_accounts_exhausted_stops_without_looping(self):
         bridge=self.make_bridge()
         with patch.object(bridge,'rpc',side_effect=self.fake_rpc) as rpc:

@@ -47,6 +47,40 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn('CODEX_THREAD_ID', a)
         self.assertEqual(Path(a['CODEX_HOME']), app.account_home('personal'))
 
+    def test_shared_settings_apply_to_manual_remote_and_backend(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            app.permissions('yolo')
+            app.defaults('test-model', 'high')
+        for args in [(), ('resume', self.sid), ('--remote', 'unix:///tmp/test.sock'), ('app-server',)]:
+            cmd = app.command(*args)
+            self.assertIn('approval_policy="never"', cmd)
+            self.assertIn('sandbox_mode="danger-full-access"', cmd)
+            self.assertIn('model="test-model"', cmd)
+            self.assertIn('model_reasoning_effort="high"', cmd)
+        app.private_dir(app.account_home('new-account'))
+        self.assertEqual((app.account_home('personal')/'auth.json').read_text(), '{"test_credentials":true}')
+        with contextlib.redirect_stdout(io.StringIO()):
+            app.permissions('default')
+            app.defaults(clear=True)
+        self.assertEqual(app.permission_args(), [])
+        self.assertEqual(app.model_args(), [])
+
+    def test_shared_settings_are_opt_in_and_invalid_modes_fail(self):
+        self.assertEqual(app.permission_args(), [])
+        self.assertEqual(app.model_args(), [])
+        app.atomic_json(app.ROOT/'permissions.json', {'mode':'invalid'})
+        with self.assertRaises(app.Error):
+            app.command('app-server')
+
+    def test_model_defaults_keep_explicit_override_and_partial_updates(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            app.defaults('test-model', 'high')
+            app.defaults(effort='low')
+        cmd = app.command('--model', 'override-model')
+        self.assertIn('model_reasoning_effort="low"', cmd)
+        self.assertEqual(cmd[cmd.index('--model')+1], 'override-model')
+        self.assertIn('model="test-model"', cmd)
+
     def test_move_preserves_full_history_and_roundtrip_avoids_duplicates(self):
         original = self.path.read_bytes()
         self.quiet_move(app.choose_session(self.sid), 'work')

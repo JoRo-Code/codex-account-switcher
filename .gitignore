@@ -12,5 +12,7 @@ backups/
 routing.json
 owners.json
 updates.json
+permissions.json
+defaults.json
 .codex-accounts.install.json
 .codex-accounts.previous

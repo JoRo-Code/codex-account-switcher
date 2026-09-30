@@ -16,7 +16,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = '0.4.0'
+VERSION = '0.4.1'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -84,11 +84,57 @@ def environment(name):
     env['CODEX_HOME'] = str(require_account(name))
     return env
 
+def permission_args():
+    mode = read_json(ROOT / 'permissions.json', {}).get('mode', 'default')
+    if mode == 'yolo':
+        return ['-c', 'approval_policy="never"', '-c', 'sandbox_mode="danger-full-access"']
+    if mode != 'default':
+        raise Error('Unknown shared permission mode. Use: codex-accounts permissions default|yolo')
+    return []
+
+def permissions(mode=None):
+    if mode:
+        with lock('permissions'):
+            atomic_json(ROOT / 'permissions.json', {'mode': mode})
+    current = read_json(ROOT / 'permissions.json', {}).get('mode', 'default')
+    print('Shared launcher permissions: ' + current)
+    if current == 'yolo':
+        print('All launcher accounts: no approval prompts, unrestricted filesystem and network.')
+    else:
+        print('Use each account’s Codex configuration and project defaults.')
+    if mode:
+        print('Restart existing launcher sessions to apply. Desktop and other Codex processes are not changed.')
+
+def model_args():
+    settings = read_json(ROOT / 'defaults.json', {})
+    result = []
+    for key in ('model', 'model_reasoning_effort'):
+        value = settings.get(key)
+        if value is not None:
+            if not isinstance(value, str) or not value.strip():
+                raise Error('Invalid shared model defaults. Use codex-accounts defaults --clear.')
+            result += ['-c', key + '=' + json.dumps(value)]
+    return result
+
+def defaults(model=None, effort=None, clear=False):
+    with lock('defaults'):
+        settings = {} if clear else read_json(ROOT / 'defaults.json', {})
+        if model is not None:
+            if not model.strip(): raise Error('Model cannot be empty.')
+            settings['model'] = model
+        if effort is not None: settings['model_reasoning_effort'] = effort
+        if clear or model is not None or effort is not None:
+            atomic_json(ROOT / 'defaults.json', settings)
+    print('Shared launcher model defaults:')
+    print(json.dumps(settings, indent=2) if settings else 'Use each account’s Codex configuration.')
+    print('Applies to new launches across all accounts. --model and in-chat selections override defaults.')
+
 def command(*args):
     if not shutil.which(BINARY):
         raise Error('Codex CLI was not found on PATH. Install Codex first.')
     return [BINARY, *args, '-c', 'cli_auth_credentials_store="file"',
-            '-c', 'forced_login_method="chatgpt"', '-c', 'model_provider="openai"']
+            '-c', 'forced_login_method="chatgpt"', '-c', 'model_provider="openai"',
+            *model_args(), *permission_args()]
 
 def owners():
     return read_json(ROOT / 'owners.json', {})
@@ -730,6 +776,12 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__, epilog='No command opens the interactive menu.')
     p.add_argument('--version', action='version', version=VERSION)
     sub = p.add_subparsers(dest='action')
+    s = sub.add_parser('permissions', help='Shared permissions for all launcher accounts')
+    s.add_argument('mode', nargs='?', choices=['default', 'yolo'])
+    s = sub.add_parser('defaults', help='Shared model defaults for all launcher accounts')
+    s.add_argument('--model')
+    s.add_argument('--effort', choices=['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+    s.add_argument('--clear', action='store_true')
     s = sub.add_parser('update', help='Update the installed CLI without reinstalling')
     s.add_argument('operation', nargs='?', choices=['policy'])
     s.add_argument('policy', nargs='?', choices=['auto', 'notify', 'off'])
@@ -775,6 +827,14 @@ def main(argv=None):
     args = parser().parse_args(argv)
     os.umask(0o077)
     private_dir(ROOT)
+    if args.action == 'permissions':
+        permissions(args.mode)
+        return 0
+    if args.action == 'defaults':
+        if args.clear and (args.model is not None or args.effort is not None):
+            raise Error('--clear cannot be combined with --model or --effort.')
+        defaults(args.model, args.effort, args.clear)
+        return 0
     if args.action == 'update':
         if args.operation:
             if args.check or args.rollback or args.prerelease:

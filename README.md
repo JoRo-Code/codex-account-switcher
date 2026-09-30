@@ -146,6 +146,23 @@ History transfer is a local, version-sensitive mechanism, not a built-in OpenAI 
 
 Account homes start fresh. Your existing `~/.codex` configuration, plugins, MCP authentication, and desktop history are not copied. Configure account-specific settings in `~/.local/share/codex-accounts/accounts/NAME/config.toml`; project-level settings continue to load normally. The launcher forces file-based ChatGPT credentials and the OpenAI provider. Managed authentication restrictions still apply.
 
+### Shared permissions and model defaults
+
+Set these once for every existing and future launcher account:
+
+```sh
+codex-accounts permissions yolo
+codex-accounts defaults --model gpt-6-astra --effort medium
+codex-accounts permissions                 # Show permission mode
+codex-accounts defaults                    # Show model defaults
+```
+
+YOLO sets `approval_policy="never"` and `sandbox_mode="danger-full-access"`: unrestricted filesystem and network access without command approval prompts. It is opt-in. These shared settings apply to manual starts, resumes, the automatic terminal, and replacement backends after account switching. Explicit `--model` and in-chat choices override model defaults; automatic continuation preserves the current chat’s model and permission choices. Organization requirements still apply, and this does not grant OS permissions or authenticate plugins.
+
+Restart existing launcher sessions to apply new defaults. Settings are stored separately from the executable in `permissions.json` and `defaults.json` under the launcher data root, survive updates/reinstallation, and apply to accounts added later. They are independent of `~/.codex/config.toml`; changes there are not automatically synchronized. Use `codex-accounts permissions default` and `codex-accounts defaults --clear` to return to account-specific configuration.
+
+Run launcher commands in your shell, not as a prompt inside another Codex chat. An outer Codex session has its own permissions and may ask for approval before it can launch the command.
+
 This controls the CLI only. It does not change the desktop app, IDE extension, or existing ordinary `codex` processes. Avoid editing the same project files concurrently unless you intend to coordinate that work.
 
 `CODEX_ACCOUNTS_HOME` overrides launcher storage. `CODEX_ACCOUNTS_BINARY` selects a Codex executable. Uninstall the command by removing `~/.local/bin/codex-accounts`; account data remains in the storage directory until you separately remove it.
