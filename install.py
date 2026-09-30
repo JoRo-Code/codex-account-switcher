@@ -2,6 +2,7 @@
 """Install codex-accounts into ~/.local/bin without changing your shell settings."""
 import os
 import argparse
+import json
 from pathlib import Path
 import shutil
 import sys
@@ -27,7 +28,16 @@ try:
 finally:
     if os.path.exists(temp):
         os.unlink(temp)
+marker = destination.with_name('.' + destination.name + '.install.json')
+fd, temporary = tempfile.mkstemp(dir=bin_dir)
+try:
+    with os.fdopen(fd, 'w') as stream:
+        json.dump({'repository': 'JoRo-Code/codex-account-switcher'}, stream)
+    os.replace(temporary, marker)
+finally:
+    if os.path.exists(temporary): os.unlink(temporary)
 print('Installed:', destination)
+print('Future updates: codex-accounts update (automatic checks are also enabled at launch).')
 if str(bin_dir) not in os.environ.get('PATH', '').split(os.pathsep):
     print('Add this line to your shell configuration:')
     import shlex

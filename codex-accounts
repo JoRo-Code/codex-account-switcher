@@ -16,7 +16,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = '0.3.0'
+VERSION = '0.4.0'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -527,10 +527,216 @@ def list_accounts():
     print('Email and plan are from cached Codex identity; quota and token validity are not checked.')
     print('Live limits and session locations: codex-accounts status --watch')
 
+# Updates replace only this installed executable. Account data lives elsewhere.
+import ast
+import urllib.request
+import urllib.error
+import urllib.parse
+
+RELEASE_REPO = 'JoRo-Code/codex-account-switcher'
+RELEASE_API = 'https://api.github.com/repos/' + RELEASE_REPO + '/releases?per_page=100'
+UPDATE_INTERVAL = 3600
+
+def executable_path():
+    return Path(__file__).resolve()
+
+def install_marker(path):
+    return path.with_name('.' + path.name + '.install.json')
+
+def version_tuple(value):
+    match = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', value or '')
+    if not match: raise Error('Release version is not a supported semantic version.')
+    return tuple(int(n) for n in match.groups())
+
+def fetch_public(url, limit=2_000_000):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != 'https' or parsed.hostname not in ('api.github.com', 'github.com'):
+        raise Error('Update URL is not an approved HTTPS endpoint.')
+    request = urllib.request.Request(url, headers={'User-Agent': 'codex-accounts/' + VERSION,
+                                                  'Accept': 'application/vnd.github+json' if parsed.hostname == 'api.github.com' else 'application/octet-stream'})
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            final = urllib.parse.urlparse(response.geturl())
+            if final.scheme != 'https' or final.hostname not in ('api.github.com', 'github.com',
+                    'release-assets.githubusercontent.com', 'objects.githubusercontent.com'):
+                raise Error('Update download redirected to an unapproved endpoint.')
+            data = response.read(limit + 1)
+            if len(data) > limit: raise Error('Update response exceeds the size limit.')
+            return data
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise Error('Cannot reach GitHub releases. Check your connection and retry.') from exc
+
+def newest_release(include_prerelease=False):
+    releases = json.loads(fetch_public(RELEASE_API))
+    if not isinstance(releases, list): raise Error('Invalid release catalog.')
+    candidates = []
+    for release in releases:
+        if release.get('draft') or (release.get('prerelease') and not include_prerelease): continue
+        try: version = version_tuple(release.get('tag_name'))
+        except Error: continue
+        candidates.append((version, release))
+    if not candidates: raise Error('No eligible release found. Use --prerelease to include preview releases.')
+    return max(candidates, key=lambda entry: entry[0])[1]
+
+def release_asset(release, name):
+    matches = [a for a in release.get('assets', []) if a.get('name') == name and a.get('state') == 'uploaded']
+    if len(matches) != 1: raise Error('Release is missing the verified standalone update assets.')
+    asset = matches[0]
+    expected = f'https://github.com/{RELEASE_REPO}/releases/download/{release["tag_name"]}/{name}'
+    if asset.get('browser_download_url') != expected: raise Error('Unexpected update artifact URL.')
+    return asset
+
+def verified_release(release):
+    asset = release_asset(release, 'codex-accounts')
+    checksum_asset = release_asset(release, 'codex-accounts.sha256')
+    checksum = fetch_public(checksum_asset['browser_download_url'], 4096).decode('ascii').strip()
+    match = re.fullmatch(r'([a-fA-F0-9]{64})\s+\*?codex-accounts', checksum)
+    if not match: raise Error('Invalid release checksum file.')
+    payload = fetch_public(asset['browser_download_url'])
+    actual = hashlib.sha256(payload).hexdigest()
+    if actual != match[1].lower(): raise Error('Update checksum mismatch; installed CLI was not changed.')
+    digest = asset.get('digest')
+    if digest and digest != 'sha256:' + actual: raise Error('GitHub artifact digest mismatch.')
+    try:
+        tree = ast.parse(payload.decode('utf-8'))
+        versions = [node.value.value for node in tree.body if isinstance(node, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == 'VERSION' for t in node.targets)
+                    and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)]
+    except (SyntaxError, UnicodeError) as exc:
+        raise Error('Downloaded launcher is not valid Python.') from exc
+    if versions != [release['tag_name'].lstrip('v')]:
+        raise Error('Downloaded launcher version does not match its release.')
+    if b'Local ChatGPT account selection for Codex CLI' not in payload:
+        raise Error('Downloaded artifact is not the expected launcher.')
+    return payload
+
+def installed_version(path):
+    try:
+        tree = ast.parse(path.read_text())
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'VERSION' for t in node.targets):
+                value = ast.literal_eval(node.value)
+                version_tuple(value)
+                return value
+    except (OSError, SyntaxError, ValueError, TypeError):
+        pass
+    raise Error('Cannot determine the installed version; executable was not changed.')
+
+def stage_executable(destination, payload):
+    fd, temporary = tempfile.mkstemp(prefix='.' + destination.name + '-', dir=destination.parent)
+    path = Path(temporary)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(payload); stream.flush(); os.fsync(stream.fileno())
+        path.chmod(0o755)
+        result = subprocess.run([sys.executable, str(path), '--version'], capture_output=True,
+                                text=True, timeout=10)
+        if result.returncode:
+            raise Error('New launcher failed its startup check; installed CLI was not changed.')
+        version_tuple(result.stdout.strip())
+        return path, result.stdout.strip()
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+def write_binary(path, payload):
+    fd, temporary = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(payload); stream.flush(); os.fsync(stream.fileno())
+        os.chmod(temporary, 0o755)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
+
+def update_settings():
+    return read_json(ROOT / 'updates.json', {})
+
+def record_update(**fields):
+    settings = update_settings()
+    settings.update(fields)
+    atomic_json(ROOT / 'updates.json', settings)
+
+def update_policy(policy=None):
+    with lock('update'):
+        if policy: record_update(policy=policy)
+        selected = update_settings().get('policy', 'auto')
+    print('Update policy: ' + selected)
+    print('Automatic checks run at launch, at most once an hour. Running sessions are not restarted.')
+
+def self_update(check=False, rollback=False, prerelease=False):
+    destination = executable_path()
+    if not check and any((parent / '.git').exists() for parent in destination.parents):
+        raise Error('This is a source checkout. Run the installed codex-accounts update, or use git pull here.')
+    backup = destination.with_name('.' + destination.name + '.previous')
+    with lock('update'):
+        if rollback:
+            if not backup.exists(): raise Error('No previous installed version is available.')
+            staged, target = stage_executable(destination, backup.read_bytes())
+            try:
+                write_binary(backup, destination.read_bytes())
+                os.replace(staged, destination)
+            finally: staged.unlink(missing_ok=True)
+            record_update(policy='notify', installed_version=target, last_check=time.time(), last_error=None)
+            print('Rolled back to ' + target + '. Update policy is now notify to prevent immediate reinstallation.')
+            return True
+        current = installed_version(destination)
+        release = newest_release(prerelease)
+        target = release['tag_name'].lstrip('v')
+        record_update(last_check=time.time(), available_version=target, last_error=None)
+        if version_tuple(target) <= version_tuple(current):
+            print('Already up to date (' + current + ').')
+            return False
+        if check:
+            print(f'Update available: {current} -> {target}. Run codex-accounts update' + (' --prerelease' if prerelease else '') + '.')
+            return False
+        payload = verified_release(release)
+        staged, staged_version = stage_executable(destination, payload)
+        try:
+            if staged_version != target: raise Error('Startup version does not match the selected release.')
+            write_binary(backup, destination.read_bytes())
+            os.replace(staged, destination)
+        finally: staged.unlink(missing_ok=True)
+        atomic_json(install_marker(destination), {'repository': RELEASE_REPO, 'version': target})
+        record_update(installed_version=target)
+        print(f'Updated {current} -> {target}. Accounts and history are unchanged.')
+        print('Running conversations keep their current version; new launches use the update.')
+        return True
+
+def maybe_auto_update():
+    destination = executable_path()
+    marker = read_json(install_marker(destination), {})
+    if marker.get('repository') != RELEASE_REPO: return
+    settings = update_settings()
+    policy = settings.get('policy', 'auto')
+    if policy == 'off' or time.time() - settings.get('last_check', 0) < UPDATE_INTERVAL: return
+    try:
+        # Avoid delaying unrelated commands with repeated checks during outages.
+        with lock('update'):
+            record_update(last_check=time.time())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            changed = self_update(check=policy == 'notify')
+        if changed or 'Update available:' in output.getvalue():
+            print(output.getvalue(), end='', file=sys.stderr)
+        if changed:
+            os.execv(sys.executable, [sys.executable, str(destination), *sys.argv[1:]])
+    except (Error, OSError, ValueError, subprocess.SubprocessError):
+        # CLI work must remain available offline. Explicit update reports errors.
+        return
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__, epilog='No command opens the interactive menu.')
     p.add_argument('--version', action='version', version=VERSION)
     sub = p.add_subparsers(dest='action')
+    s = sub.add_parser('update', help='Update the installed CLI without reinstalling')
+    s.add_argument('operation', nargs='?', choices=['policy'])
+    s.add_argument('policy', nargs='?', choices=['auto', 'notify', 'off'])
+    flags = s.add_mutually_exclusive_group()
+    flags.add_argument('--check', action='store_true', help='Check without installing')
+    flags.add_argument('--rollback', action='store_true', help='Restore the previous executable')
+    s.add_argument('--prerelease', action='store_true', help='Include experimental release versions')
     for action in ['add', 'login']:
         s = sub.add_parser(action, help='Connect a ChatGPT account' if action == 'add' else 'Reconnect an account')
         s.add_argument('account')
@@ -569,6 +775,16 @@ def main(argv=None):
     args = parser().parse_args(argv)
     os.umask(0o077)
     private_dir(ROOT)
+    if args.action == 'update':
+        if args.operation:
+            if args.check or args.rollback or args.prerelease:
+                raise Error('Update policy cannot be combined with update flags.')
+            update_policy(args.policy)
+        else:
+            if args.policy: raise Error('Use update policy auto|notify|off.')
+            self_update(args.check, args.rollback, args.prerelease)
+        return 0
+    maybe_auto_update()
     if args.action is None:
         return menu()
     if args.action in ('add', 'login'):

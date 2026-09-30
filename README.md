@@ -24,6 +24,26 @@ export PATH="$HOME/.local/bin:$PATH"
 
 The installer copies the executable to `~/.local/bin/codex-accounts`. It does not modify shell settings, your existing Codex login, or your default Codex configuration.
 
+## Update without reinstalling
+
+```sh
+codex-accounts update                  # Download and replace the installed CLI
+codex-accounts update --check          # Check without installing
+codex-accounts update policy           # Show the update policy
+codex-accounts update policy auto      # Automatic updates (default)
+codex-accounts update policy notify    # Report availability without installing
+codex-accounts update policy off       # Only update when explicitly requested
+codex-accounts update --rollback       # Restore the previous executable
+```
+
+Installed copies check GitHub for stable releases when launched, at most once an hour. Available updates are verified, installed, and used for the requested command. There is no update daemon; an already-open conversation is never restarted. Offline update failures do not prevent normal CLI use. `--help` and `--version` do not check for updates. Automatic updates are limited to copies registered by `install.py`, not source checkouts.
+
+Updates download the standalone executable and SHA-256 checksum from this repository's GitHub Releases. The updater verifies the checksum, GitHub's artifact digest when supplied, the embedded version, and a startup check before atomically replacing the executable. This trusts this GitHub repository and HTTPS; checksums are integrity checks, not independent release signatures. A backup supports rollback. Rollback sets the policy to `notify` to avoid immediately reinstalling the same update. Updates do not downgrade; `--prerelease` explicitly includes preview releases for a manual check or update.
+
+Connected accounts, cached credentials, history, and routing settings remain in the data directory. `updates.json` stores the check time and update policy. Conversations already running keep their loaded code until they exit; subsequent launches use the new version.
+
+**One-time bootstrap for versions before 0.4.0:** those versions do not contain an updater. Run `git pull` and `python3 install.py` once. After that, use `codex-accounts update`; no new clone or reinstall is needed. A source checkout is updated with Git rather than overwritten by the executable updater.
+
 ## Connect accounts
 
 ```sh
@@ -136,6 +156,7 @@ This controls the CLI only. It does not change the desktop app, IDE extension, o
 python3 test_launcher.py
 python3 test_auto.py
 python3 test_status.py
+python3 test_update.py
 python3 test_native_history.py
 ```
 
@@ -150,3 +171,13 @@ The launcher uses only the Python standard library. Unit tests run without a Cod
 Report bugs in [GitHub Issues](https://github.com/JoRo-Code/codex-account-switcher/issues). Include the CLI versions and error text, but never attach `auth.json`, tokens, or private conversation histories.
 
 Released under the [MIT license](LICENSE). This is an independent project, not an official OpenAI product.
+
+### Publishing a new version
+
+Update `VERSION`, commit the changes, run the tests, and push the matching version tag. Then publish with:
+
+```sh
+python3 scripts/publish_release.py --notes-file /path/to/release-notes.md
+```
+
+The publisher uploads a standalone CLI, its checksum, and a source archive to a draft release, then publishes it only after all assets are present. Use `--prerelease` for preview releases; automatic updaters ignore previews. Keep CLI/data compatibility so rollback remains possible. The GitHub CLI must be authenticated with permission to publish releases.

@@ -11,3 +11,6 @@ backups/
 *.jsonl
 routing.json
 owners.json
+updates.json
+.codex-accounts.install.json
+.codex-accounts.previous
