@@ -36,6 +36,8 @@ Shows current connected emails and live quota, saved conversations per account, 
 
 Starting in v0.7.0, activity is stored in the private `activity.sqlite` database and survives process exit and updates. Restart older launcher sessions to enable recording. A stored history file indicates its current location, not which account executed all its old turns. Imported history is not retroactively attributed to the destination account. A move records an assignment; an observed turn start records execution under that account. Exact per-chat quota consumption and Desktop activity are unavailable. Emails shown identify accounts currently connected to each label; the audit tracks labels. New manual CLI sessions do not expose a reliable chat ID, so their launches are retained separately in JSON rather than guessed.
 
+Since v0.7.1, temporary helper threads cannot replace the main chat’s tracking or reconnect settings. Unmatched sessions from older launchers appear separately as unverified tracking. Exit and reopen those sessions with `codex-accounts continue` when convenient; updating does not replace code already loaded in running processes.
+
 ## Install
 
 Requires macOS or Linux, Python 3.9+, and a Codex CLI supporting `--remote unix://` and the app-server protocol (transport and paginated migration checked against installed Codex 0.159.2). Manual mode also uses `--no-daemon`. Automatic mode depends on an experimental Codex interface, so rerun the tests after CLI upgrades.

@@ -37,6 +37,24 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(result['conversations'][0]['running'][0]['phase'],'working')
         self.assertEqual(result['unassigned_launches'][0]['account'],'work')
 
+    def test_old_unmatched_launcher_is_not_counted_as_an_extra_chat(self):
+        app.atomic_json(app.ROOT/'runs/old.json',dict(pid=os.getpid(),account='personal',
+            session='helper-id',mode='auto',title='Same title'))
+        result=self.overview()
+        self.assertEqual(len(result['conversations']),1)
+        self.assertEqual(result['unverified_launches'][0]['session'],'helper-id')
+        with patch.object(app,'local_chats',return_value=[]),patch.object(app,'collect_status',return_value=[]),contextlib.redirect_stdout(io.StringIO()) as output:
+            app.show_overview()
+        self.assertIn('chat tracking unverified',output.getvalue())
+        self.assertIn('no verified running session',output.getvalue())
+
+    def test_current_unsaved_launcher_remains_a_conversation(self):
+        app.atomic_json(app.ROOT/'runs/new.json',dict(pid=os.getpid(),account='personal',
+            session='new-id',mode='auto',tracking_version=app.VERSION))
+        result=self.overview()
+        self.assertEqual(len(result['conversations']),2)
+        self.assertEqual(result['unverified_launches'],[])
+
     def test_historical_account_filter_includes_moved_chat(self):
         app.record_activity(self.sid,'personal','auto_opened')
         with contextlib.redirect_stdout(io.StringIO()):app.move(app.choose_session(self.sid),'work')

@@ -65,6 +65,7 @@ class AutoTests(unittest.TestCase):
         bridge.from_client({'id': 1, 'method': 'thread/resume', 'params': {
             'threadId': self.sid, 'model': 'chosen-model', 'approvalPolicy': 'never',
             'sandbox': 'danger-full-access'}})
+        bridge.from_backend({'id': 1, 'result': {'thread': {'id': self.sid}}})
         bridge.from_client({'id': 2, 'method': 'turn/start', 'params': {
             'threadId': self.sid, 'model': 'chosen-model', 'effort': 'high',
             'approvalPolicy': 'never', 'sandboxPolicy': {'type': 'dangerFullAccess'},
@@ -77,6 +78,40 @@ class AutoTests(unittest.TestCase):
         self.assertEqual(calls['turn/start']['approvalPolicy'], 'never')
         self.assertEqual(calls['turn/start']['model'], 'chosen-model')
         self.assertEqual(calls['turn/start']['effort'], 'high')
+
+    def test_ephemeral_helpers_cannot_replace_main_chat_or_options(self):
+        bridge = self.make_bridge()
+        bridge.title = 'Main chat'
+        bridge.thread_options.update(approvalPolicy='never', sandbox='danger-full-access')
+        bridge.continuation_options = {'effort': 'high'}
+        options = dict(bridge.thread_options)
+        session_lock = bridge.session_lock
+        for method in ('thread/start', 'thread/resume', 'thread/fork'):
+            other = str(uuid.uuid4())
+            bridge.from_client({'id': 10, 'method': method, 'params': {
+                'model': 'helper-model', 'sandbox': 'read-only', 'ephemeral': True}})
+            bridge.from_backend({'id': 10, 'result': {'thread': {
+                'id': other, 'ephemeral': True, 'name': 'Helper', 'model': 'helper-model'}}})
+            bridge.from_client({'id': 11, 'method': 'turn/start', 'params': {
+                'threadId': other, 'model': 'helper-model', 'effort': 'low'}})
+            with patch.object(bridge, 'failover') as failover:
+                bridge.from_backend(self.completion(sid=other))
+            failover.assert_not_called()
+        self.assertEqual(bridge.sid, self.sid)
+        self.assertEqual(bridge.title, 'Main chat')
+        self.assertIs(bridge.session_lock, session_lock)
+        self.assertEqual(bridge.thread_options, options)
+        self.assertEqual(bridge.continuation_options, {'effort': 'high'})
+        self.assertEqual(bridge.pending_thread_options, {})
+        self.assertEqual({e['session'] for e in app.activity_records()}, {self.sid})
+
+    def test_failed_resume_does_not_change_main_options(self):
+        bridge = self.make_bridge()
+        options = dict(bridge.thread_options)
+        bridge.from_client({'id': 10, 'method': 'thread/resume', 'params': {'model': 'other'}})
+        bridge.from_backend({'id': 10, 'error': {'code': -1, 'message': 'failed'}})
+        self.assertEqual(bridge.thread_options, options)
+        self.assertEqual(bridge.pending_thread_options, {})
 
     def test_paginated_failover_uses_metadata_resume_then_continues(self):
         self.rows[0]['payload']['history_mode'] = 'paginated'

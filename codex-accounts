@@ -19,7 +19,7 @@ import textwrap
 import uuid
 import unicodedata
 
-VERSION = '0.7.0'
+VERSION = '0.7.1'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -825,8 +825,12 @@ def conversation_overview(include_local=False):
             row['observed_accounts'].append(event['account'])
         if event['title']: row['title'] = event['title']
     runs = active_runs()
+    unverified = []
     for run in runs:
         sid = run.get('session')
+        if sid and sid not in rows and run.get('mode') == 'auto' and not run.get('tracking_version'):
+            unverified.append(run)
+            continue
         if not sid: continue
         row = rows.setdefault(sid, dict(id=sid,title=run.get('title') or '(untitled)',cwd=run.get('cwd') or '',
                                        modified=run.get('started') or 0,stored_account=None,
@@ -839,7 +843,7 @@ def conversation_overview(include_local=False):
         for row in locals_:
             rows[row['id']] = dict(row, stored_account=None, activity=[], running=[], observed_accounts=[])
     return dict(conversations=sorted(rows.values(),key=lambda r:r['modified'],reverse=True),
-                local_unknown_count=len(locals_), unassigned_launches=[r for r in runs if not r.get('session')],
+                local_unknown_count=len(locals_), unverified_launches=unverified, unassigned_launches=[r for r in runs if not r.get('session')],
                 unidentified_manual_history=[e for e in events if not e['session']],
                 tracking_since=min((e['timestamp'] for e in events),default=None))
 
@@ -874,7 +878,7 @@ def show_overview(query='', account=None, include_local=False, history=False, li
         print('  Project: '+clean_text(row['cwd']))
         if row['running']:
             print('  Running: '+'; '.join(r['account']+' · '+clean_text(r.get('phase') or 'CLI open') for r in row['running']))
-        else: print('  Launcher state: not running')
+        else: print('  Launcher state: '+('no verified running session' if overview['unverified_launches'] else 'not running'))
         print('  Stored under: '+(row['stored_account'] or ('local/Desktop' if row.get('source_home') else 'not found in saved history')))
         print('  Accounts observed in use: '+(', '.join(row['observed_accounts']) or 'not recorded yet'))
         print('  Updated: '+dt.datetime.fromtimestamp(row['modified']).strftime('%Y-%m-%d %H:%M %Z'))
@@ -884,6 +888,11 @@ def show_overview(query='', account=None, include_local=False, history=False, li
                 timestamp = dt.datetime.fromtimestamp(event['timestamp']).strftime('%m-%d %H:%M:%S')
                 route = (event['previous_account']+' → ' if event['previous_account'] else '')+event['account']
                 print(f"    {timestamp} · {event['event'].replace('_',' ')} · {route}")
+    for run in overview['unverified_launches']:
+        if account and run['account'] != account: continue
+        print(f"\nOlder launcher · {run['account']} · PID {run['pid']} · chat tracking unverified")
+        print('  '+clean_text(run.get('title') or run.get('cwd')))
+        print('  Exit and reopen with codex-accounts continue when convenient to restore tracking.')
     for run in overview['unassigned_launches']:
         if account and run['account'] != account: continue
         print(f"\nOpen CLI without a known chat ID: {run['account']} · {clean_text(run.get('cwd'))} · PID {run['pid']}")
@@ -1466,6 +1475,7 @@ class AutoBridge:
         self.sid = None
         self.initialize = None
         self.pending = {}
+        self.pending_thread_options = {}
         self.counter = 0
         self.tried = set()
         self.snapshot = None
@@ -1496,10 +1506,12 @@ class AutoBridge:
             self.account_lock = None
     def update_marker(self):
         atomic_json(self.marker, dict(pid=os.getpid(),account=self.name,session=self.sid,
+                                     tracking_version=VERSION,
                                      cwd=self.thread_options.get('cwd') or self.cwd, started=self.started,
                                      updated=time.time(),mode='auto',phase=self.phase,
                                      model=self.thread_options.get('model'),title=self.title))
     def set_thread(self, thread):
+        if thread.get('ephemeral'): return
         sid = thread['id']
         if sid != self.sid:
             if self.session_lock:
@@ -1527,11 +1539,12 @@ class AutoBridge:
             self.update_marker()
         if method == 'initialize':
             self.initialize = params
-        if method in ('thread/start','thread/resume'):
-            # Preserve the client-selected permissions/model on reconnect.
-            self.thread_options = {k:v for k,v in params.items() if k in
+        if method in ('thread/start','thread/resume','thread/fork') and 'id' in message:
+            # Only adopt these options after a persistent-thread response.
+            self.pending_thread_options[json.dumps(message['id'])] = {
+                k:v for k,v in params.items() if k in
                 ('model','cwd','approvalPolicy','approvalsReviewer','sandbox','serviceTier','personality','config')}
-        if method == 'turn/start':
+        if method == 'turn/start' and self.sid and params.get('threadId') == self.sid:
             self.phase = 'starting turn'
             if not self.title:
                 self.title = next((x.get('text') for x in params.get('input', []) if x.get('type') == 'text'), None)
@@ -1571,8 +1584,12 @@ class AutoBridge:
                 self.snapshot = {**(self.snapshot or {}), **{k:v for k,v in incoming.items() if v is not None}}
         if 'id' in message and not method:
             original = self.pending.pop(json.dumps(message['id']), None)
+            options = self.pending_thread_options.pop(json.dumps(message['id']), {})
             if original in ('thread/start','thread/resume','thread/fork') and 'result' in message:
-                self.set_thread(message['result']['thread'])
+                thread = message['result']['thread']
+                if not thread.get('ephemeral'):
+                    self.thread_options = options
+                    self.set_thread(thread)
     def from_backend(self, message):
         self.inspect(message)
         self.ws.send(message)
@@ -1619,6 +1636,7 @@ class AutoBridge:
         for ident in list(self.pending):
             self.ws.send(dict(id=json.loads(ident), error=dict(code=-32000,message='Account is reconnecting; retry this request.')))
         self.pending.clear()
+        self.pending_thread_options.clear()
         # The bridge already owns this conversation's exclusive lock.
         with contextlib.redirect_stdout(io.StringIO()):
             move(row, target, already_locked=True)
