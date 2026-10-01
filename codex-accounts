@@ -19,7 +19,7 @@ import textwrap
 import uuid
 import unicodedata
 
-VERSION = '0.9.0'
+VERSION = '0.10.0'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -661,7 +661,7 @@ def menu():
     elif action == 'Automatic account routing':
         return auto_run()
     elif action == 'Set up Codex Desktop':
-        return setup_desktop()
+        return open_setup_window()
     elif action == 'Connect another account':
         login(input('Account name: ').strip(), create=True)
     elif action == 'Account status':
@@ -1162,6 +1162,7 @@ def self_update(check=False, rollback=False, prerelease=False):
         return True
 
 def maybe_auto_update():
+    if os.environ.get('CODEX_ACCOUNTS_NO_UPDATE') == '1': return
     destination = executable_path()
     marker = read_json(install_marker(destination), {})
     if marker.get('repository') != RELEASE_REPO: return
@@ -1191,6 +1192,10 @@ def parser():
     s = sub.add_parser('setup', help='Connect accounts and configure native Desktop on macOS')
     s.add_argument('--account', help='Preferred initial account')
     s.add_argument('--port', type=int, help='Optional fixed localhost SSH port')
+    s.add_argument('--terminal', action='store_true', help='Use the text-only setup instead of the browser window')
+    s = sub.add_parser('setup-window', help=argparse.SUPPRESS)
+    s.add_argument('--account')
+    s.add_argument('--port', type=int)
     s = sub.add_parser('desktop', help='Manage the Desktop background services')
     s.add_argument('operation', choices=['status','start','stop','restart'])
     s.add_argument('--json', action='store_true')
@@ -1259,14 +1264,15 @@ def parser():
     s.add_argument('--interval', type=int, default=30, help='Watch refresh seconds (minimum 10)')
     s.add_argument('--json', action='store_true', help='Print a structured snapshot')
     sub._choices_actions = [a for a in sub._choices_actions if a.help != argparse.SUPPRESS]
-    sub.metavar = '{'+','.join(name for name in sub.choices if name not in ('desktop-shell','desktop-proxy'))+'}'
+    sub.metavar = '{'+','.join(name for name in sub.choices if name not in ('desktop-shell','desktop-proxy','setup-window'))+'}'
     return p
 
 def main(argv=None):
     args = parser().parse_args(argv)
     os.umask(0o077)
     private_dir(ROOT)
-    if args.action == 'setup': return setup_desktop(args.account,args.port)
+    if args.action == 'setup': return (setup_desktop if args.terminal else open_setup_window)(args.account,args.port)
+    if args.action == 'setup-window': return serve_setup_window(args.account,args.port)
     if args.action == 'desktop-shell': return desktop_shell()
     if args.action == 'desktop-proxy': return desktop_proxy(args.arguments)
     if args.action == 'desktop':
@@ -2404,6 +2410,179 @@ def desktop_proxy(args):
         raise Error('Use the Codex Auto Desktop project or codex-accounts auto for chats; codex-accounts add/login manages accounts.')
     os.execv(native,[native,*args])
 
+
+# The setup page has no external assets. Its capability lives in the URL fragment,
+# never in HTTP logs, and every API request requires it plus a loopback Host.
+SETUP_HTML = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Codex Accounts</title>
+<style>
+:root{font:16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#202b29;background:#f4f6f3}*{box-sizing:border-box}body{margin:0}main{max-width:760px;margin:64px auto;padding:0 24px}header{margin-bottom:32px}.eyebrow{font-size:12px;letter-spacing:2px;font-weight:700;color:#587267}h1{font-size:40px;letter-spacing:-1.6px;margin:12px 0}h2{font-size:20px;margin:0}p{line-height:1.6;color:#60706a}.card{background:white;border:1px solid #dce4dc;border-radius:20px;padding:26px;margin:18px 0}.row{display:flex;align-items:center;justify-content:space-between;gap:16px}.account{padding:16px 0;border-bottom:1px solid #edf0eb}.account:last-child{border:0}.muted,small{color:#66776e;font-size:14px}button{border:0;border-radius:10px;padding:12px 18px;background:#17664b;color:white;font:inherit;font-weight:600;cursor:pointer}button.secondary{background:#eef3ec;color:#315445}button:disabled{opacity:.5;cursor:default}input{font:inherit;border:1px solid #ccd7ce;border-radius:10px;padding:12px;width:100%;margin:12px 0}.badge{font-size:12px;background:#eef3ec;padding:6px 10px;border-radius:20px;white-space:nowrap}#message{padding:14px 18px;line-height:1.5;background:#e8eee7;border-radius:12px;position:sticky;top:12px;z-index:1}#message:empty{display:none}#message.error{color:#a3312a}code{background:#eef3ec;padding:5px 9px;border-radius:6px}details{margin-top:16px}li{margin:14px 0;line-height:1.5}footer{font-size:13px;color:#718078;line-height:1.6;margin:26px 0}a{color:#17664b}@media(max-width:500px){main{margin:28px auto}h1{font-size:32px}.card{padding:20px}.row{flex-wrap:wrap}}
+</style><main><header><div class="eyebrow">CODEX ACCOUNTS</div><h1>Your accounts. One connection.</h1><p>Add your accounts once. Chats on Codex Auto can switch accounts when a usage limit is reached.</p></header><div id="message" role="status" aria-live="polite"></div>
+<section class="card"><div class="row"><h2>1. Accounts</h2><button class="secondary" id="refresh">Refresh usage</button></div><div id="accounts"><p>Loading your accounts…</p></div><form id="addform"><label for="label">Account label <small>(optional)</small></label><input id="label" maxlength="40" placeholder="e.g. Personal or Work" autocomplete="off"><button id="add">Add account</button></form><p class="muted">Sign in with the account you want to add in the browser that opens.</p></section>
+<section class="card"><div class="row"><h2>2. Connect</h2><span id="badge" class="badge">Checking</span></div><p id="explain">We’ll configure and start the local connection for you. It starts automatically when you log in to this Mac.</p><button id="connect" disabled>Connect</button><div id="desktop" hidden><h3>Finish in Codex Desktop</h3><p>The local connection is ready. Link it in Desktop once:</p><ol><li>Open <strong>Settings → Connections → SSH → Add</strong>.</li><li>Use hostname <code id="alias">codex-auto</code> <button id="copy" class="secondary">Copy</button>. Leave port and identity blank.</li><li>Add a project folder on that connection, then start a chat there.</li></ol><p class="muted">Already linked? You’re ready to use that project. Existing chats stay on their current connection.</p></div></section>
+<footer>Runs privately on this Mac. Account credentials stay on this device.<br>Closing this page leaves your chats and background connection running.</footer></main>
+<script>
+const token=location.hash.slice(1)||sessionStorage.getItem('setup-token')||'';sessionStorage.setItem('setup-token',token);history.replaceState(null,'',location.pathname);let busy=false;
+const $=id=>document.getElementById(id);const say=(s,error=false)=>{$('message').textContent=s;$('message').className=error?'error':''};
+async function api(path,body){const r=await fetch('/api/'+path,{method:body?'POST':'GET',headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok)throw Error(r.status===403?'This setup page expired. Run codex-accounts setup to open it again.':'Could not reach setup. Reopen with codex-accounts setup.');return r.json()}
+function render(s){busy=s.job.busy;for(const id of ['add','refresh','connect'])$(id).disabled=busy;const box=$('accounts');box.replaceChildren();for(const a of s.accounts){const d=document.createElement('div');d.className='account';const name=document.createElement('strong');name.textContent=a.label+(a.email?' · '+a.email:'');d.append(name);const p=document.createElement('p');p.className='muted';p.textContent=a.detail;d.append(p);box.append(d)}if(!s.accounts.length){const p=document.createElement('p');p.textContent='Connect your first account to get started.';box.append(p)}$('connect').disabled=busy||!s.accounts.some(a=>a.connected);$('connect').hidden=s.ready;$('desktop').hidden=!s.ready;$('alias').textContent=s.alias;$('badge').textContent=s.ready?'Local connection ready':'Not connected';$('explain').hidden=s.ready;if(s.job.message)say(s.job.message,s.job.error)}
+async function poll(){try{render(await api('state'))}catch(e){say(e.message,true)}}
+async function action(name,extra={}){if(busy)return;busy=true;for(const id of ['add','refresh','connect'])$(id).disabled=true;try{const s=await api('action',{action:name,...extra});render(s)}catch(e){busy=false;say(e.message,true)}}
+$('addform').onsubmit=e=>{e.preventDefault();action('add',{label:$('label').value.trim()})};$('refresh').onclick=()=>action('refresh');$('connect').onclick=()=>action('connect');$('copy').onclick=async()=>{try{await navigator.clipboard.writeText($('alias').textContent);$('copy').textContent='Copied'}catch(e){say('Hostname: '+$('alias').textContent)}};
+poll();setInterval(poll,2500);
+</script></html>'''
+
+class SetupWindow:
+    def __init__(self, account=None, port=None):
+        import secrets
+        self.token=secrets.token_urlsafe(32)
+        self.account,self.port=account,port
+        self.mutex=threading.Lock()
+        self.job=dict(busy=False,message='',error=False)
+        self.reports=[]
+        self.last_seen=time.monotonic()
+
+    def snapshot(self):
+        settings=read_json(ROOT/DESKTOP_FILE,{})
+        ready=False
+        if settings:
+            # Only local readiness is claimed, never a Desktop client connection.
+            sock=socket.socket(socket.AF_UNIX);sock.settimeout(.2)
+            ssh=socket.socket();ssh.settimeout(.2)
+            try:
+                sock.connect(settings['socket']);ssh.connect(('127.0.0.1',settings['port']));ready=True
+            except OSError:pass
+            finally:sock.close();ssh.close()
+        with self.mutex:
+            reports={r['label']:r for r in self.reports};job=dict(self.job)
+        rows=[]
+        for name in accounts():
+            r=reports.get(name,{})
+            connected=(account_home(name)/'auth.json').is_file()
+            identity=r.get('identity',('','', ''))
+            detail=re.sub(r'\[[#-]+\] ', '', ' · '.join(line for line in usage_lines(r['usage']) if '% left' in line)) if r.get('usage') else ('Usage not checked' if connected else 'Sign-in not complete — add this label again to retry')
+            if not detail:detail='Usage unavailable — refresh to check again'
+            rows.append(dict(label=name,email=identity[0] if identity[0]!='—' else '',connected=connected,detail=detail))
+        return dict(accounts=rows,ready=ready,alias=settings.get('alias','codex-auto'),job=job)
+
+    def start(self, action, label=''):
+        if action not in ('connect','add','refresh'):raise Error('Unknown setup action')
+        if not isinstance(label,str) or (label and not NAME.fullmatch(label)):raise Error('Use letters, numbers, hyphens or underscores for the account label.')
+        with self.mutex:
+            if self.job['busy']:raise Error('An operation is already running.')
+            self.job=dict(busy=True,error=False,message={'connect':'Configuring and checking your local connection…','add':'Complete sign-in in the browser. This may take a few minutes.','refresh':'Checking account usage…'}[action])
+        threading.Thread(target=self.work,args=(action,label),daemon=True).start()
+
+    def work(self, action, label):
+        message='';failed=False
+        try:
+            with lock('setup-window-job'):
+                if action=='refresh':
+                    reports=collect_status()
+                    with self.mutex:self.reports=reports
+                    message='Usage updated.'
+                else:
+                    args=[sys.executable,str(executable_path())]
+                    if action=='connect':
+                        args+=['setup','--terminal']
+                        if self.account:args+=['--account',self.account]
+                        if self.port is not None:args+=['--port',str(self.port)]
+                    else:
+                        if not label:
+                            index=1
+                            while 'account-'+str(index) in accounts():index+=1
+                            label='account-'+str(index)
+                        if (account_home(label)/'auth.json').exists():raise Error('That label is already connected. Choose another label for a new account.')
+                        args+=['login' if label in accounts() else 'add',label]
+                    env=dict(os.environ,CODEX_ACCOUNTS_HOME=str(ROOT),CODEX_ACCOUNTS_NO_UPDATE='1')
+                    # No OAuth URLs or credentials are forwarded to the web page.
+                    process=subprocess.Popen(args,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=env,start_new_session=True)
+                    try:code=process.wait(timeout=600 if action=='add' else 90)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid,signal.SIGTERM);process.wait(timeout=10)
+                        raise Error('This step timed out. You can retry it here.')
+                    if code:raise Error('Sign-in did not finish. Try Add account again with the same label.' if action=='add' else 'Connection setup could not finish. Run codex-accounts setup --terminal for the detailed error. Running chats were not restarted.')
+                    message='Account added. Connect when you’re ready.' if action=='add' else 'Local connection ready. Finish the one-time link in Codex Desktop.'
+                    reports=collect_status()
+                    with self.mutex:self.reports=reports
+        except (Error,OSError,ValueError,subprocess.SubprocessError) as exc:
+            message=str(exc);failed=True
+        finally:
+            with self.mutex:self.job=dict(busy=False,error=failed,message=message)
+
+
+def setup_http_server(window):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import secrets
+    class Handler(BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup();self.connection.settimeout(5)
+        def log_message(self,*args):pass
+        def reply(self,status,payload,html=False):
+            body=payload.encode() if html else json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header('Content-Type','text/html; charset=utf-8' if html else 'application/json')
+            self.send_header('Content-Length',str(len(body)))
+            self.send_header('Cache-Control','no-store')
+            self.send_header('X-Content-Type-Options','nosniff')
+            self.send_header('Referrer-Policy','no-referrer')
+            self.send_header('Content-Security-Policy',"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+            self.end_headers();self.wfile.write(body)
+        def allowed(self,auth=True):
+            host='127.0.0.1:'+str(self.server.server_port)
+            return (self.headers.get('Host')==host and
+                    self.headers.get('Origin','http://'+host)=='http://'+host and
+                    (not auth or secrets.compare_digest(self.headers.get('Authorization','').encode(),('Bearer '+window.token).encode())))
+        def do_GET(self):
+            if not self.allowed(auth=self.path!='/'):return self.reply(403,{})
+            if self.path=='/':return self.reply(200,SETUP_HTML,True)
+            if self.path=='/api/state':
+                window.last_seen=time.monotonic()
+                return self.reply(200,window.snapshot())
+            self.reply(404,{})
+        def do_POST(self):
+            if not self.allowed():return self.reply(403,{})
+            if self.path!='/api/action':return self.reply(404,{})
+            try:
+                length=int(self.headers.get('Content-Length','0'))
+                if not 0<length<=1024:raise ValueError()
+                data=json.loads(self.rfile.read(length))
+                if not isinstance(data,dict):raise ValueError()
+                window.start(data.get('action'),data.get('label',''))
+            except (ValueError,TypeError):return self.reply(400,{})
+            except Error as exc:
+                with window.mutex:
+                    if not window.job['busy']:window.job=dict(busy=False,error=True,message=str(exc))
+                return self.reply(200,window.snapshot())
+            self.reply(200,window.snapshot())
+    return ThreadingHTTPServer(('127.0.0.1',0),Handler)
+
+
+def serve_setup_window(account=None,port=None):
+    import webbrowser
+    window=SetupWindow(account,port)
+    server=setup_http_server(window);server.timeout=1
+    url='http://127.0.0.1:'+str(server.server_port)+'/#'+window.token
+    window.start('refresh')
+    if not webbrowser.open(url):
+        server.server_close();raise Error('Could not open a browser. Use setup --terminal instead.')
+    try:
+        while time.monotonic()-window.last_seen<1800 or window.job['busy']:
+            server.handle_request()
+    finally:server.server_close()
+    return 0
+
+
+def open_setup_window(account=None,port=None):
+    if sys.platform!='darwin':raise Error('Desktop setup currently supports macOS only.')
+    args=[sys.executable,str(executable_path()),'setup-window']
+    if account:args+=['--account',account]
+    if port is not None:args+=['--port',str(port)]
+    # Detach so closing the terminal cannot interrupt login or the setup page.
+    subprocess.Popen(args,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                     start_new_session=True,env=dict(os.environ,CODEX_ACCOUNTS_HOME=str(ROOT)))
+    print('Opening Codex Accounts in your browser. Choose Add account or Connect there.')
+    print('If the window does not open: codex-accounts setup --terminal')
+    return 0
 
 if __name__ == '__main__':
     try:

@@ -12,9 +12,17 @@ After installing, run:
 codex-accounts setup
 ```
 
-The wizard guides browser login if you have no connected accounts, checks available quota, creates a dedicated localhost SSH key and alias, and installs two user LaunchAgents for the router and SSH endpoint. They start when you log in and restart after a crash. Existing accounts, histories, and permissions are preserved. Re-running setup leaves running services and keys unchanged. No admin password, macOS Remote Login, external server, or Python packages are needed.
+This opens a private setup page in your browser:
 
-In native Codex Desktop, open **Settings → Connections → SSH** and select **codex-auto**. If it is not listed, add a connection with display name **Codex Auto** and hostname **codex-auto**. Leave port and identity blank: OpenSSH supplies them from the generated alias. If that alias was already taken, setup prints a unique alternative. Add a project folder on this host, then start a new chat there. The final Desktop connection/project selection is manual; setup does not control Desktop's UI or move existing chats automatically.
+1. **Add account** opens ChatGPT sign-in. Repeat for each account; labels are optional.
+2. **Connect** configures and checks the local SSH connection and background services.
+3. Follow the short **Finish in Codex Desktop** card once to link the connection and add a project on it.
+
+The page shows connected account identities, usage, progress, and local connection readiness. It never claims Desktop is linked just because the local services are ready. Codex Desktop still requires its own connection/project selection; there is no supported automatic approval API. Existing chats stay on their current connection.
+
+Setup creates a dedicated localhost SSH key and alias and installs two user LaunchAgents. They start when you log in and restart after a crash. Re-running setup preserves accounts, histories, permissions, keys, and running services. No admin password, macOS Remote Login, external server, or Python packages are needed. Closing the page does not stop your chats. Its local web server exits after 30 minutes without page activity.
+
+For headless use or detailed setup diagnostics, run `codex-accounts setup --terminal`.
 
 ```sh
 codex-accounts add work             # Browser login for another account
