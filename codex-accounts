@@ -19,7 +19,7 @@ import textwrap
 import uuid
 import unicodedata
 
-VERSION = '0.12.0'
+VERSION = '0.12.1'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -84,9 +84,11 @@ def require_account(name):
 # Credentials, histories, databases, writer locks and temporary tool state stay
 # in the selected account home. Never link the whole CODEX_HOME.
 SHARED_DIRECTORIES = ('skills', 'plugins', 'rules', 'agents', 'prompts', 'hooks',
-                      'automations', 'pets', 'packages', 'browser', 'computer-use',
-                      '.tmp/bundled-marketplaces')
+                      'automations', 'pets', 'packages', 'browser', 'computer-use')
 SHARED_FILES = ('config.toml', 'AGENTS.md', 'hooks.json', 'installation_id', 'chrome-native-hosts-v2.json')
+# Desktop materializes different catalogs for local and SSH hosts. Linking the
+# generated directory lets SSH's smaller catalog replace the local catalog.
+RETIRED_SHARED_DIRECTORIES = ('.tmp/bundled-marketplaces',)
 
 @contextlib.contextmanager
 def shared_lock():
@@ -139,12 +141,39 @@ def shared_resource_names(source, home):
     names.extend(path.name for root in (source, home) for path in root.glob('*.config.toml'))
     return list(dict.fromkeys(names))
 
+def retire_shared_resources(home, source, manifest_path, manifest):
+    """Restore resources shared by older versions; retry interrupted restores."""
+    entries = manifest['entries']
+    for relative in RETIRED_SHARED_DIRECTORIES:
+        entry = entries.get(relative)
+        if entry is None: continue
+        path, target = home / relative, source / relative
+        backup = Path(entry['backup']) if entry.get('backup') else None
+        linked = path.is_symlink() and path.resolve() == target.resolve()
+        exists = path.exists() or path.is_symlink()
+        backup_exists = backup and (backup.exists() or backup.is_symlink())
+        restored = entry.get('restore_started') and not linked and (
+            backup and not backup_exists and exists or not backup and not exists)
+        unmoved = not entry.get('installed') and backup and not backup_exists and exists
+        if not restored and not unmoved:
+            if exists and not linked:
+                raise Error('Shared path changed externally; preserve it before syncing: ' + str(path))
+            if backup and not backup_exists:
+                raise Error('Original shared-path backup is missing: ' + str(backup))
+            entry['restore_started'] = True
+            atomic_json(manifest_path, manifest)
+            path.unlink(missing_ok=True)
+            if backup_exists: os.replace(backup, path)
+        del entries[relative]
+        atomic_json(manifest_path, manifest)
+
 def link_shared_home(name, source):
     home = require_account(name)
     manifest_path = ROOT / 'shared-links' / (name + '.json')
     manifest = read_json(manifest_path, {'home': str(source), 'entries': {}})
     if manifest['home'] != str(source):
         raise Error('Disable the current shared home before choosing another one.')
+    retire_shared_resources(home, source, manifest_path, manifest)
     entries = manifest['entries']
     for relative in shared_resource_names(source, home):
         path, target = home / relative, source / relative

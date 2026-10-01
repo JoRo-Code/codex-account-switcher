@@ -108,6 +108,62 @@ class SharedCapabilitiesTests(unittest.TestCase):
         app.environment('new-account')
         self.assertEqual((app.account_home('new-account') / 'later.config.toml').resolve(), source / 'later.config.toml')
 
+    def legacy_marketplace_link(self, source, name='personal', original=True):
+        relative = '.tmp/bundled-marketplaces'
+        home = app.account_home(name)
+        path = home / relative
+        path.parent.mkdir(exist_ok=True)
+        (source / relative).mkdir(parents=True, exist_ok=True)
+        backup = app.ROOT / 'shared-backups' / name / 'legacy' / relative if original else None
+        if backup:
+            backup.mkdir(parents=True)
+            (backup / 'original.json').write_text('Original account catalog')
+        path.symlink_to(source / relative, target_is_directory=True)
+        manifest_path = app.ROOT / 'shared-links' / (name + '.json')
+        app.atomic_json(manifest_path, {'home': str(source), 'entries': {
+            relative: {'backup': str(backup) if backup else None, 'installed': True}}})
+        return path, backup, manifest_path
+
+    def test_generated_marketplaces_are_isolated_and_legacy_links_are_retired(self):
+        source = self.source()
+        path, _, manifest = self.legacy_marketplace_link(source)
+        other, _, _ = self.legacy_marketplace_link(source, 'work', original=False)
+        canonical = source / '.tmp/bundled-marketplaces/local.json'
+        canonical.write_text('Local Desktop catalog')
+        self.sync(source)
+        self.assertFalse(path.is_symlink())
+        self.assertEqual((path / 'original.json').read_text(), 'Original account catalog')
+        self.assertFalse(other.exists())
+        self.assertNotIn('.tmp/bundled-marketplaces', json.loads(manifest.read_text())['entries'])
+        (path / 'local.json').write_text('SSH catalog with fewer plugins')
+        self.assertEqual(canonical.read_text(), 'Local Desktop catalog')
+        self.off()
+        self.assertEqual((path / 'local.json').read_text(), 'SSH catalog with fewer plugins')
+
+    def test_retiring_a_legacy_marketplace_link_recovers_after_backup_was_restored(self):
+        source = self.source()
+        path, backup, _ = self.legacy_marketplace_link(source)
+        replace = app.os.replace
+        def interrupted(old, new):
+            result = replace(old, new)
+            if old == backup: raise OSError('Interrupted after restore')
+            return result
+        with patch.object(app.os, 'replace', side_effect=interrupted):
+            with self.assertRaises(OSError): self.sync(source)
+        self.sync(source)
+        self.assertEqual((path / 'original.json').read_text(), 'Original account catalog')
+        self.assertFalse(path.is_symlink())
+
+    def test_retiring_a_legacy_marketplace_link_preserves_external_edits(self):
+        source = self.source()
+        path, backup, _ = self.legacy_marketplace_link(source)
+        path.unlink()
+        path.mkdir()
+        (path / 'external.json').write_text('External catalog')
+        with self.assertRaisesRegex(app.Error, 'changed externally'): self.sync(source)
+        self.assertEqual((path / 'external.json').read_text(), 'External catalog')
+        self.assertTrue(backup.exists())
+
     def test_invalid_shared_homes_do_not_change_account_configuration(self):
         for source in (app.ROOT, app.ROOT.parent, app.ROOT / 'accounts', app.account_home('personal')):
             with self.assertRaises(app.Error): self.sync(source)
