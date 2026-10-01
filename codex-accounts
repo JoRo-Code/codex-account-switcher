@@ -19,7 +19,7 @@ import textwrap
 import uuid
 import unicodedata
 
-VERSION = '0.11.0'
+VERSION = '0.12.1'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -80,7 +80,252 @@ def require_account(name):
         raise Error('Unknown account. Connect it with: codex-accounts add ' + name)
     return home
 
+# Only user configuration and explicitly identified capabilities are shared.
+# Credentials, histories, databases, writer locks and temporary tool state stay
+# in the selected account home. Never link the whole CODEX_HOME.
+SHARED_DIRECTORIES = ('skills', 'plugins', 'rules', 'agents', 'prompts', 'hooks',
+                      'automations', 'pets', 'packages', 'browser', 'computer-use')
+SHARED_FILES = ('config.toml', 'AGENTS.md', 'hooks.json', 'installation_id', 'chrome-native-hosts-v2.json')
+# Desktop materializes different catalogs for local and SSH hosts. Linking the
+# generated directory lets SSH's smaller catalog replace the local catalog.
+RETIRED_SHARED_DIRECTORIES = ('.tmp/bundled-marketplaces',)
+
+@contextlib.contextmanager
+def shared_lock():
+    private_dir(ROOT / 'locks')
+    with (ROOT / 'locks/shared.lock').open('a') as stream:
+        # Two independent chats may start together; wait rather than rejecting
+        # a valid account launch while the other installs its links.
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+def shared_settings():
+    return read_json(ROOT / 'shared.json', {})
+
+def validate_shared_home(raw):
+    source = Path(raw).expanduser().resolve()
+    isolated = (ROOT / 'accounts').resolve()
+    if source == ROOT or source == isolated or isolated in source.parents or source in isolated.parents:
+        raise Error('Shared home must be separate from launcher storage and account homes.')
+    if source.exists() and not source.is_dir():
+        raise Error('Shared Codex home must be a directory.')
+    return source
+
+def merge_missing(source, destination):
+    """Union installed resources; canonical files win, including symlinks."""
+    if not source.exists() and not source.is_symlink(): return
+    if not destination.exists() and not destination.is_symlink():
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if source.is_symlink():
+            resolved = source.resolve()
+            if (ROOT / 'accounts').resolve() in resolved.parents:
+                raise Error('Shared capability points into an account home: ' + str(source))
+            try: destination.symlink_to(resolved)
+            except FileExistsError: pass
+        elif source.is_dir(): destination.mkdir(exist_ok=True, mode=0o700)
+        else:
+            descriptor, temporary = tempfile.mkstemp(prefix='.shared-copy-', dir=destination.parent)
+            os.close(descriptor)
+            try:
+                shutil.copy2(source, temporary)
+                # Atomic publication without overwriting a concurrent canonical
+                # install. Interrupted copies never become canonical files.
+                try: os.link(temporary, destination)
+                except FileExistsError: pass
+            finally: Path(temporary).unlink(missing_ok=True)
+    if source.is_dir() and destination.is_dir() and not source.is_symlink() and not destination.is_symlink():
+        for child in source.iterdir(): merge_missing(child, destination / child.name)
+
+def shared_resource_names(source, home):
+    names = list(SHARED_DIRECTORIES) + list(SHARED_FILES)
+    names.extend(path.name for root in (source, home) for path in root.glob('*.config.toml'))
+    return list(dict.fromkeys(names))
+
+def retire_shared_resources(home, source, manifest_path, manifest):
+    """Restore resources shared by older versions; retry interrupted restores."""
+    entries = manifest['entries']
+    for relative in RETIRED_SHARED_DIRECTORIES:
+        entry = entries.get(relative)
+        if entry is None: continue
+        path, target = home / relative, source / relative
+        backup = Path(entry['backup']) if entry.get('backup') else None
+        linked = path.is_symlink() and path.resolve() == target.resolve()
+        exists = path.exists() or path.is_symlink()
+        backup_exists = backup and (backup.exists() or backup.is_symlink())
+        restored = entry.get('restore_started') and not linked and (
+            backup and not backup_exists and exists or not backup and not exists)
+        unmoved = not entry.get('installed') and backup and not backup_exists and exists
+        if not restored and not unmoved:
+            if exists and not linked:
+                raise Error('Shared path changed externally; preserve it before syncing: ' + str(path))
+            if backup and not backup_exists:
+                raise Error('Original shared-path backup is missing: ' + str(backup))
+            entry['restore_started'] = True
+            atomic_json(manifest_path, manifest)
+            path.unlink(missing_ok=True)
+            if backup_exists: os.replace(backup, path)
+        del entries[relative]
+        atomic_json(manifest_path, manifest)
+
+def link_shared_home(name, source):
+    home = require_account(name)
+    manifest_path = ROOT / 'shared-links' / (name + '.json')
+    manifest = read_json(manifest_path, {'home': str(source), 'entries': {}})
+    if manifest['home'] != str(source):
+        raise Error('Disable the current shared home before choosing another one.')
+    retire_shared_resources(home, source, manifest_path, manifest)
+    entries = manifest['entries']
+    for relative in shared_resource_names(source, home):
+        path, target = home / relative, source / relative
+        if path.is_symlink() and path.resolve() == target.resolve():
+            if relative in entries and not entries[relative].get('installed'):
+                entries[relative]['installed'] = True
+                atomic_json(manifest_path, manifest)
+            continue
+        previous = entries.get(relative)
+        # Optional files are linked only when present; never fabricate native
+        # host registrations or hook JSON. The config is always available.
+        exists = path.exists() or path.is_symlink()
+        if previous and exists:
+            # Codex preserves these links when writing configuration. A
+            # detached/repointed path belongs to the user; never overwrite it.
+            backup = Path(previous['backup']) if previous.get('backup') else None
+            if previous.get('installed') or not backup or backup.exists() or backup.is_symlink():
+                raise Error('Shared path changed externally; preserve it before syncing: ' + str(path))
+        if not target.exists() and not target.is_symlink() and not exists:
+            if relative == 'config.toml':
+                target.write_text('')
+                target.chmod(0o600)
+            elif relative in SHARED_DIRECTORIES:
+                target.mkdir(parents=True, exist_ok=True, mode=0o700)
+            else: continue
+        if exists:
+            # Do not read credentials from outside capability paths or follow
+            # an existing capability link back into an account being replaced.
+            if path.is_symlink():
+                resolved = path.resolve()
+                if (ROOT / 'accounts').resolve() in resolved.parents:
+                    raise Error('Shared capability points into an account home: ' + relative)
+            merge_missing(path, target)
+        if target.is_symlink() and (ROOT / 'accounts').resolve() in target.resolve().parents:
+            raise Error('Canonical capability points into an account home: ' + relative)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        backup = Path(previous['backup']) if previous and previous.get('backup') else None
+        if exists and backup is None:
+            backup = ROOT / 'shared-backups' / name / str(uuid.uuid4()) / relative
+            private_dir(backup.parent)
+        # Record the recovery location before changing either path. A partial
+        # migration can be retried or undone without losing the original.
+        entries[relative] = {'backup': str(backup) if backup else None, 'installed': False}
+        atomic_json(manifest_path, manifest)
+        if backup and exists: os.replace(path, backup)
+        temporary = path.with_name('.' + path.name + '.shared-' + uuid.uuid4().hex)
+        try:
+            temporary.symlink_to(target, target_is_directory=relative in SHARED_DIRECTORIES)
+            os.replace(temporary, path)
+            entries[relative]['installed'] = True
+            atomic_json(manifest_path, manifest)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return len(entries)
+
+def prepare_shared_home(name):
+    settings = shared_settings()
+    if not settings.get('enabled'): return
+    with shared_lock():
+        settings = shared_settings()
+        if settings.get('enabled'):
+            if settings.get('restoring'):
+                raise Error('Run shared off to finish restoring account capabilities before launching.')
+            source = validate_shared_home(settings['home'])
+            source.mkdir(parents=True, exist_ok=True, mode=0o700)
+            link_shared_home(name, source)
+
+def disable_shared_home():
+    settings = shared_settings()
+    if not settings.get('enabled'): return
+    source = validate_shared_home(settings['home'])
+    # Validate before detaching anything. External edits must be preserved.
+    restores = []
+    for name in accounts():
+        manifest_path = ROOT / 'shared-links' / (name + '.json')
+        manifest = read_json(manifest_path, {})
+        for relative, entry in manifest.get('entries', {}).items():
+            if entry.get('restored'): continue
+            path = require_account(name) / relative
+            backup = Path(entry['backup']) if entry.get('backup') else None
+            linked = path.is_symlink() and path.resolve() == (source / relative).resolve()
+            # A restore may have consumed its backup before the completion
+            # record was written. Keep the restored path on a retry.
+            if entry.get('restore_started') and not linked:
+                if backup and not (backup.exists() or backup.is_symlink()) and (path.exists() or path.is_symlink()): continue
+                if not backup and not (path.exists() or path.is_symlink()): continue
+            if path.exists() or path.is_symlink():
+                if not linked:
+                    if not entry.get('installed') and backup and not (backup.exists() or backup.is_symlink()):
+                        continue  # Backup move never occurred; original remains.
+                    raise Error('Shared path changed externally; preserve it before disabling: ' + str(path))
+            if backup and not (backup.exists() or backup.is_symlink()):
+                raise Error('Original shared-path backup is missing: ' + str(backup))
+            restores.append((path, backup, manifest_path, manifest, entry))
+    atomic_json(ROOT / 'shared.json', {**settings, 'restoring': True})
+    for path, backup, manifest_path, manifest, entry in restores:
+        entry['restore_started'] = True
+        atomic_json(manifest_path, manifest)
+        path.unlink(missing_ok=True)
+        if backup and (backup.exists() or backup.is_symlink()): os.replace(backup, path)
+        entry['restored'] = True
+        atomic_json(manifest_path, manifest)
+    for name in accounts(): (ROOT / 'shared-links' / (name + '.json')).unlink(missing_ok=True)
+    atomic_json(ROOT / 'shared.json', {**settings, 'enabled': False, 'restoring': False})
+
+def shared_capabilities(operation='status', source_home=None, as_json=False):
+    if source_home is not None and operation != 'sync':
+        raise Error('--source-home is only supported with shared sync.')
+    if operation != 'status':
+        with shared_lock():
+            if operation == 'off': disable_shared_home()
+            else:
+                settings = shared_settings()
+                if settings.get('restoring'):
+                    raise Error('Run shared off to finish restoring account capabilities before syncing.')
+                source = validate_shared_home(source_home or settings.get('home') or Path.home() / '.codex')
+                if settings.get('enabled') and Path(settings['home']) != source:
+                    raise Error('Run shared off before choosing another source home.')
+                source.mkdir(parents=True, exist_ok=True, mode=0o700)
+                atomic_json(ROOT / 'shared.json', {'enabled': True, 'home': str(source)})
+                for name in accounts(): link_shared_home(name, source)
+    settings = shared_settings()
+    result = {'enabled': bool(settings.get('enabled')), 'home': settings.get('home'),
+              'accounts': accounts(), 'resources': list(SHARED_DIRECTORIES) + list(SHARED_FILES)}
+    result['profiles'] = {}
+    if result['enabled']:
+        source = validate_shared_home(settings['home'])
+        for name in accounts():
+            home = require_account(name)
+            linked, pending = [], []
+            for relative in shared_resource_names(source, home):
+                path, target = home / relative, source / relative
+                if relative not in SHARED_DIRECTORIES and relative != 'config.toml' and not (target.exists() or path.exists() or path.is_symlink()):
+                    continue
+                if path.is_symlink() and path.resolve() == target.resolve(): linked.append(relative)
+                else: pending.append(relative)
+            result['profiles'][name] = {'linked': linked, 'pending': pending}
+    if as_json: print(json.dumps(result, indent=2))
+    else:
+        print('Shared Codex capabilities: ' + ('enabled' if result['enabled'] else 'disabled'))
+        if result['home']: print('Source home: ' + result['home'])
+        if result['enabled']:
+            ready = sum(not profile['pending'] for profile in result['profiles'].values())
+            print('Linked profiles: ' + str(ready) + '/' + str(len(result['accounts'])))
+        if operation == 'sync':
+            print('Existing profiles linked; new accounts and replacement backends inherit the same capabilities.')
+            print('Original profile resources are retained in shared-backups. Running backends keep loaded settings until reopened.')
+        if operation == 'off': print('Original account resources restored. Shared source files remain available.')
+    return result
+
 def environment(name):
+    prepare_shared_home(name)
     env = os.environ.copy()
     for key in AUTH_ENV:
         env.pop(key, None)
@@ -1224,6 +1469,10 @@ def parser():
     s.add_argument('--model')
     s.add_argument('--effort', choices=['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
     s.add_argument('--clear', action='store_true')
+    s = sub.add_parser('shared', help='Share Codex configuration, plugins, skills and browser capabilities across accounts')
+    s.add_argument('operation', nargs='?', choices=['status', 'sync', 'off'], default='status')
+    s.add_argument('--source-home', type=Path, help='Canonical Codex home (default: ~/.codex)')
+    s.add_argument('--json', action='store_true')
     s = sub.add_parser('update', help='Update the installed CLI without reinstalling')
     s.add_argument('operation', nargs='?', choices=['policy'])
     s.add_argument('policy', nargs='?', choices=['auto', 'notify', 'off'])
@@ -1288,6 +1537,9 @@ def main(argv=None):
         if args.clear and (args.model is not None or args.effort is not None):
             raise Error('--clear cannot be combined with --model or --effort.')
         defaults(args.model, args.effort, args.clear)
+        return 0
+    if args.action == 'shared':
+        shared_capabilities(args.operation, args.source_home, args.json)
         return 0
     if args.action == 'update':
         if args.operation:

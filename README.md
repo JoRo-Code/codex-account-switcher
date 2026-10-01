@@ -1,6 +1,6 @@
 # Codex Account Switcher
 
-A local launcher for multiple ChatGPT accounts in Codex CLI. Automatic mode keeps the native Codex terminal open and reconnects a quota-failed conversation under another connected account. Each account has its own login and state. Multiple terminal sessions can use different accounts simultaneously. No external router, API key, or Python packages are required. The local bridge forwards terminal protocol messages to the official Codex app-server; model traffic goes directly from Codex to OpenAI.
+A local launcher for multiple ChatGPT accounts in Codex CLI. Automatic mode keeps the native Codex terminal open and reconnects a quota-failed conversation under another connected account. Each account has its own login and conversation state; configuration and capabilities can be shared across accounts. Multiple terminal sessions can use different accounts simultaneously. No external router, API key, or Python packages are required. The local bridge forwards terminal protocol messages to the official Codex app-server; model traffic goes directly from Codex to OpenAI.
 
 > **Experimental:** simulated failover and offline compatibility checks pass. Live quota failover has not yet been validated.
 
@@ -52,7 +52,7 @@ codex-accounts continue --list           # Browse without starting anything
 codex-accounts continue billing --account codex2
 ```
 
-An existing local chat is imported as a separate terminal copy. Its original stays in Desktop or the ordinary CLI; later messages do not sync between copies. After import the picker prefers the launcher copy so it does not repeatedly import the original. Stop/close the original session before importing; Codex's native writer lock may prevent import while the original remains loaded. Credentials, plugins, and account configuration are not copied. Launcher defaults and the chat's saved settings apply as described below.
+An existing local chat is imported as a separate terminal copy. Its original stays in Desktop or the ordinary CLI; later messages do not sync between copies. After import the picker prefers the launcher copy so it does not repeatedly import the original. Stop/close the original session before importing; Codex's native writer lock may prevent import while the original remains loaded. Import never copies credentials or changes capability sharing. Shared capabilities, launcher defaults and the chat's saved settings apply as described below.
 
 This does **not** switch the account of an in-place Desktop chat. The Codex Auto SSH connection provides a separate managed backend for native Desktop. A menu-bar account picker is not implemented. Cloud-only ChatGPT chats are not imported.
 
@@ -214,7 +214,26 @@ History transfer is a local, version-sensitive mechanism, not a built-in OpenAI 
 
 ## Configuration and scope
 
-Account homes start fresh. Your existing `~/.codex` configuration, plugins, MCP authentication, and desktop history are not copied. Configure account-specific settings in `~/.local/share/codex-accounts/accounts/NAME/config.toml`; project-level settings continue to load normally. The launcher forces file-based ChatGPT credentials and the OpenAI provider. Managed authentication restrictions still apply.
+To use the same configuration and capabilities with every account:
+
+```sh
+codex-accounts shared sync                         # Use ~/.codex as the common home
+codex-accounts shared status --json                # Inspect linked and pending resources
+codex-accounts shared sync --source-home /private/common-codex
+codex-accounts shared off                          # Restore original account resources
+```
+
+Sharing is opt-in and persistent. Once enabled, existing profiles are migrated and every new account/backend is prepared before launch, including manual use, automatic failover and managed Desktop. The account's `CODEX_HOME` and `auth.json` remain separate. No login tokens, MCP OAuth stores, model-availability caches, conversation histories, databases or writer locks are copied. Account/workspace-specific app grants and organization requirements still apply.
+
+The canonical `config.toml` is shared using a filesystem link, so plugin enablement, MCP definitions, feature flags, hooks, model preferences, project settings and Desktop configuration have one source. Named `*.config.toml` profiles and `AGENTS.md`/`hooks.json` are also linked. Shared directories include skills, installed plugin resources, rules, custom agents/prompts/hooks, automation definitions, pets, packages, browser state and Computer Use state. Existing Chrome registration metadata and the installation ID are reused when available; this does not install a native host or grant browser/OS permissions. Source files remain in the chosen canonical home.
+
+Generated `.tmp/bundled-marketplaces` catalogs remain separate for each profile. Desktop generates different catalogs for local and SSH hosts; sharing this directory lets a reduced SSH catalog replace the local catalog. Version 0.12.1 restores links created by 0.12.0 from their existing backups on the next `shared sync` or account launch. Interrupted restores can be retried, and external edits are preserved.
+
+Existing account directories contribute missing installed resources to the common directories. Canonical files win on conflicts; original account files/directories are retained privately under `shared-backups`. The canonical configuration wins over old per-account configuration. Native Codex settings writes preserve the config link and reach other accounts. Interrupted migrations and restores can be retried, and externally detached/edited paths stop synchronization rather than being overwritten. `shared off` restores the original account resources and leaves the common home available. Turn sharing off before selecting a different common home.
+
+Running backends retain their loaded configuration. Reopen a chat/backend to load newly enabled integrations; restart the managed Desktop router between turns when adopting new launcher code. Chrome was verified through the managed Desktop SSH adapter using the official browser runtime: extension discovery, open-tab listing, navigation and a live accessibility snapshot. This validates that browser connection; shared files alone do not establish complete Desktop/browser/automation parity.
+
+Without sharing, account homes start fresh and per-account configuration remains in `~/.local/share/codex-accounts/accounts/NAME/config.toml`. Project-level settings continue to load normally. The launcher forces file-based ChatGPT credentials and the OpenAI provider in either mode. Managed authentication restrictions still apply.
 
 ### Shared permissions and model defaults
 
@@ -229,7 +248,7 @@ codex-accounts defaults                    # Show model defaults
 
 YOLO sets `approval_policy="never"` and `sandbox_mode="danger-full-access"`: unrestricted filesystem and network access without command approval prompts. It is opt-in. These shared settings apply to manual starts, resumes, the automatic terminal, and replacement backends after account switching. Explicit `--model` and in-chat choices override model defaults; automatic continuation preserves the current chat’s model and permission choices. Organization requirements still apply, and this does not grant OS permissions or authenticate plugins.
 
-Restart existing launcher sessions to apply new defaults. Settings are stored separately from the executable in `permissions.json` and `defaults.json` under the launcher data root, survive updates/reinstallation, and apply to accounts added later. They are independent of `~/.codex/config.toml`; changes there are not automatically synchronized. Use `codex-accounts permissions default` and `codex-accounts defaults --clear` to return to account-specific configuration.
+Restart existing launcher sessions to apply new defaults. Settings are stored separately from the executable in `permissions.json` and `defaults.json` under the launcher data root, survive updates/reinstallation, and apply to accounts added later. These command-line overrides take precedence over the shared or per-account configuration. Use `codex-accounts permissions default` and `codex-accounts defaults --clear` to return to the configured Codex defaults.
 
 Run launcher commands in your shell, not as a prompt inside another Codex chat. An outer Codex session has its own permissions and may ask for approval before it can launch the command.
 
@@ -241,6 +260,7 @@ This controls the CLI only. It does not change the desktop app, IDE extension, o
 
 ```sh
 python3 test_launcher.py
+python3 test_shared.py
 python3 test_auto.py
 python3 test_status.py
 python3 test_update.py
@@ -248,9 +268,12 @@ python3 test_native_history.py
 python3 test_native_paginated_history.py
 python3 test_continue.py
 python3 test_overview.py
+python3 test_native_shared.py
 ```
 
 Tests cover isolated credentials/environment, concurrent account locks, duplicate-resume protection, active-session move protection, complete history preservation and round trips, unsupported-format rejection, argument forwarding, and account-name validation. The paginated native check verifies A → B → A migration with a stale destination index, two preserved turns, pagination, and native writer locks. The legacy offline native check verifies that the installed Codex app server discovers the moved history and reads its user and assistant messages, without making a model request. Additional tests simulate quota failover, exhaustion of all accounts, concurrent-session routing, cooldowns, preservation of model/approval settings, isolation of subagent events, pending RPC handling, and WebSocket framing. The real native terminal was also connected through the bridge up to its authentication check. Live identity and quota retrieval have been checked with connected accounts. Model requests and real quota failover are not exercised by the tests. Automatic failover is implemented but has not yet been validated against a live account quota failure.
+
+Shared-capability unit tests cover credential/history isolation, resource union and conflicts, future accounts, concurrent starts, interrupted migration recovery, external edit protection, and rollback. The optional `test_native_shared.py` verifies common config, skill/MCP discovery and native settings writes with real Codex backends and a local fixture MCP server. It sends no model requests. The native router test also checks that shared MCP tools remain available after injected quota failover.
 
 Official building blocks: [authentication](https://learn.chatgpt.com/docs/auth) and [configuration/state locations](https://learn.chatgpt.com/docs/config-file/config-advanced).
 

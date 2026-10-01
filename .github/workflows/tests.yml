@@ -15,6 +15,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python test_launcher.py
+      - run: python test_shared.py
       - run: python test_auto.py
       - run: python test_status.py
       - run: python test_update.py

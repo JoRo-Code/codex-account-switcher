@@ -1,5 +1,5 @@
 """Native multi-client routing and disconnect/resume smoke test; no inference."""
-import json, os, select, shutil, subprocess, tempfile, time, uuid
+import json, os, select, shutil, subprocess, sys, tempfile, time, uuid
 from pathlib import Path
 
 binary=shutil.which('codex')
@@ -10,6 +10,22 @@ with tempfile.TemporaryDirectory(prefix='car-',dir='/tmp') as tmp:
     for account in ('a','b'):
         home=root/'accounts'/account;home.mkdir(parents=True)
         (home/'auth.json').write_text('{}')
+    common=root/'common';common.mkdir()
+    fixture=common/'mcp.py'
+    fixture.write_text('''import json,sys
+for line in sys.stdin:
+    request=json.loads(line)
+    if 'id' not in request: continue
+    method=request.get('method')
+    if method=='initialize': result={'protocolVersion':'2024-11-05','capabilities':{'tools':{}},'serverInfo':{'name':'shared','version':'1'}}
+    elif method=='tools/list': result={'tools':[{'name':'shared_fixture','description':'Offline test','inputSchema':{'type':'object','properties':{}}}]}
+    elif method=='resources/list': result={'resources':[]}
+    elif method=='resources/templates/list': result={'resourceTemplates':[]}
+    else: result={}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
+''')
+    (common/'config.toml').write_text('[mcp_servers.shared_fixture]\ncommand='+json.dumps(sys.executable)+'\nargs=['+json.dumps(str(fixture))+']\n')
+    (root/'shared.json').write_text(json.dumps({'enabled':True,'home':str(common)}))
     logs=root/'accounts/a/sessions/2026/09/29';logs.mkdir(parents=True)
     meta={'id':sid,'timestamp':'2026-09-29T12:00:00Z','cwd':tmp,'originator':'codex_cli_rs',
           'cli_version':'0.159.2','source':'cli','model_provider':'openai','base_instructions':{'text':'Test only.'}}
@@ -20,7 +36,7 @@ with tempfile.TemporaryDirectory(prefix='car-',dir='/tmp') as tmp:
             ('event_msg',{'type':'user_message','message':'Router history fixture','images':[]}),
             ('event_msg',{'type':'task_complete','turn_id':str(uuid.uuid4()),'last_agent_message':'Fixture complete'})]:
             f.write(json.dumps({'timestamp':'2026-09-29T12:00:00Z','type':kind,'payload':payload})+'\n')
-    env=dict(os.environ,CODEX_ACCOUNTS_HOME=tmp,CODEX_ACCOUNTS_BINARY=binary)
+    env=dict(os.environ,CODEX_ACCOUNTS_HOME=tmp,CODEX_ACCOUNTS_BINARY=binary,CODEX_ACCOUNTS_NO_UPDATE='1')
     env.pop('CODEX_THREAD_ID',None)
     logfile=(root/'router.log').open('w+')
     runner=root/'runner.py'
@@ -83,6 +99,7 @@ app.serve_router(sys.argv[2], 'a')
         c=Client();c.initialize()
         assert c.rpc('thread/resume',{'threadId':sid,'excludeTurns':True})['thread']['id']==sid
         assert b.rpc('thread/read',{'threadId':other})['thread']['id']==other
+        assert any('shared_fixture' in row['tools'] for row in c.rpc('mcpServerStatus/list',{'threadId':sid,'serverName':'shared_fixture'})['data'])
         listed=c.rpc('thread/list',{'sourceKinds':['cli','appServer','vscode'],'limit':100})['data']
         assert sid in {r['id'] for r in listed}, listed
         c.rpc('turn/start',{'threadId':sid,'input':[{'type':'text','text':'Injected test only','text_elements':[]}]})
@@ -94,9 +111,13 @@ app.serve_router(sys.argv[2], 'a')
         assert ownership.get(sid)=='b', ownership
         assert c.rpc('thread/read',{'threadId':sid})['thread']['id']==sid
         assert b.rpc('thread/read',{'threadId':other})['thread']['id']==other
+        assert any('shared_fixture' in row['tools'] for row in c.rpc('mcpServerStatus/list',{'threadId':sid,'serverName':'shared_fixture'})['data'])
+        for name in ('a','b'):
+            assert (root/'accounts'/name/'auth.json').read_text()=='{}'
+            assert (root/'accounts'/name/'config.toml').resolve()==(common/'config.toml').resolve()
         assert set(b.rpc('thread/loaded/list',{})['data'])=={sid,other}
 
-        print('PASS: native proxy, two chats, reconnect, combined history and injected quota failover through real backends; no model requests.')
+        print('PASS: native proxy, two chats, reconnect, combined history and shared MCP tools after injected quota failover; separate credentials, no model requests.')
     finally:
         for c in clients:c.close()
         server.terminate()
