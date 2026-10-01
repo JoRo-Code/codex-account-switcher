@@ -54,6 +54,31 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(popen.call_args[0][0][-2:],['add','account-1'])
         with patch.object(app.subprocess,'Popen') as popen:w.work('add','personal')
         popen.assert_not_called();self.assertTrue(w.job['error'])
+    def test_activity_api_requires_authentication(self):
+        server=self.server()
+        self.assertEqual(self.request(server,'/api/activity')[0],403)
+        with patch.object(app,'dashboard_activity',return_value={'chats':[]}):
+            code,body=self.request(server,'/api/activity',headers={'Authorization':'Bearer '+self.window.token})
+        self.assertEqual(code,200);self.assertEqual(json.loads(body),{'chats':[]})
+    def test_usage_history_is_persistent_and_deduplicates_recent_samples(self):
+        reports=[dict(label='personal',checked_at=app.time.time(),usage=None,identity=('private@example.com','plan','cached'))]
+        app.save_usage_observations(reports);app.save_usage_observations(reports)
+        with app.sqlite3.connect(app.ROOT/'usage.sqlite') as db:
+            rows=db.execute('SELECT * FROM samples').fetchall()
+        self.assertEqual(len(rows),1)
+        self.assertNotIn('private@example.com',str(rows))
+        self.assertEqual(rows[0][2],'Limits unavailable')
+    def test_dashboard_rejects_reused_pid_and_keeps_switch_direction(self):
+        row=dict(id=self.sid,title='Example',cwd='/project',modified=1,stored_account='work',observed_accounts=['personal','work'],running=[dict(pid=123,account='personal',phase='working')])
+        overview=dict(conversations=[row],unassigned_launches=[],local_unknown_count=2)
+        app.record_activity(self.sid,'work','auto_switched',previous='personal')
+        process=app.subprocess.CompletedProcess([],0,'123 /usr/bin/unrelated-process')
+        with patch.object(app,'conversation_overview',return_value=overview),patch.object(app.subprocess,'run',return_value=process):
+            data=app.dashboard_activity()
+        self.assertFalse(data['chats'][0]['live'])
+        self.assertEqual(data['chats'][0]['account'],'work')
+        self.assertEqual(data['events'][0]['previous_account'],'personal')
+        self.assertEqual(data['events'][0]['account'],'work')
     def test_parser_keeps_terminal_option_and_hides_internal_server(self):
         self.assertTrue(app.parser().parse_args(['setup','--terminal']).terminal)
         self.assertNotIn('setup-window',app.parser().format_help())

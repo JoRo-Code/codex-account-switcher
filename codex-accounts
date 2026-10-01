@@ -19,7 +19,7 @@ import textwrap
 import uuid
 import unicodedata
 
-VERSION = '0.10.0'
+VERSION = '0.11.0'
 ROOT = Path(os.environ.get('CODEX_ACCOUNTS_HOME', str(Path.home() / '.local/share/codex-accounts'))).expanduser().resolve()
 BINARY = os.environ.get('CODEX_ACCOUNTS_BINARY', 'codex')
 NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$')
@@ -2415,21 +2415,76 @@ def desktop_proxy(args):
 # never in HTTP logs, and every API request requires it plus a loopback Host.
 SETUP_HTML = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Codex Accounts</title>
 <style>
-:root{font:16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#202b29;background:#f4f6f3}*{box-sizing:border-box}body{margin:0}main{max-width:760px;margin:64px auto;padding:0 24px}header{margin-bottom:32px}.eyebrow{font-size:12px;letter-spacing:2px;font-weight:700;color:#587267}h1{font-size:40px;letter-spacing:-1.6px;margin:12px 0}h2{font-size:20px;margin:0}p{line-height:1.6;color:#60706a}.card{background:white;border:1px solid #dce4dc;border-radius:20px;padding:26px;margin:18px 0}.row{display:flex;align-items:center;justify-content:space-between;gap:16px}.account{padding:16px 0;border-bottom:1px solid #edf0eb}.account:last-child{border:0}.muted,small{color:#66776e;font-size:14px}button{border:0;border-radius:10px;padding:12px 18px;background:#17664b;color:white;font:inherit;font-weight:600;cursor:pointer}button.secondary{background:#eef3ec;color:#315445}button:disabled{opacity:.5;cursor:default}input{font:inherit;border:1px solid #ccd7ce;border-radius:10px;padding:12px;width:100%;margin:12px 0}.badge{font-size:12px;background:#eef3ec;padding:6px 10px;border-radius:20px;white-space:nowrap}#message{padding:14px 18px;line-height:1.5;background:#e8eee7;border-radius:12px;position:sticky;top:12px;z-index:1}#message:empty{display:none}#message.error{color:#a3312a}code{background:#eef3ec;padding:5px 9px;border-radius:6px}details{margin-top:16px}li{margin:14px 0;line-height:1.5}footer{font-size:13px;color:#718078;line-height:1.6;margin:26px 0}a{color:#17664b}@media(max-width:500px){main{margin:28px auto}h1{font-size:32px}.card{padding:20px}.row{flex-wrap:wrap}}
-</style><main><header><div class="eyebrow">CODEX ACCOUNTS</div><h1>Your accounts. One connection.</h1><p>Add your accounts once. Chats on Codex Auto can switch accounts when a usage limit is reached.</p></header><div id="message" role="status" aria-live="polite"></div>
-<section class="card"><div class="row"><h2>1. Accounts</h2><button class="secondary" id="refresh">Refresh usage</button></div><div id="accounts"><p>Loading your accounts…</p></div><form id="addform"><label for="label">Account label <small>(optional)</small></label><input id="label" maxlength="40" placeholder="e.g. Personal or Work" autocomplete="off"><button id="add">Add account</button></form><p class="muted">Sign in with the account you want to add in the browser that opens.</p></section>
-<section class="card"><div class="row"><h2>2. Connect</h2><span id="badge" class="badge">Checking</span></div><p id="explain">We’ll configure and start the local connection for you. It starts automatically when you log in to this Mac.</p><button id="connect" disabled>Connect</button><div id="desktop" hidden><h3>Finish in Codex Desktop</h3><p>The local connection is ready. Link it in Desktop once:</p><ol><li>Open <strong>Settings → Connections → SSH → Add</strong>.</li><li>Use hostname <code id="alias">codex-auto</code> <button id="copy" class="secondary">Copy</button>. Leave port and identity blank.</li><li>Add a project folder on that connection, then start a chat there.</li></ol><p class="muted">Already linked? You’re ready to use that project. Existing chats stay on their current connection.</p></div></section>
+:root{font:16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#202b29;background:#f4f6f3}*{box-sizing:border-box}body{margin:0}main{max-width:980px;margin:64px auto;padding:0 24px}header{margin-bottom:32px}.eyebrow{font-size:12px;letter-spacing:2px;font-weight:700;color:#587267}h1{font-size:40px;letter-spacing:-1.6px;margin:12px 0}h2{font-size:20px;margin:0}p{line-height:1.6;color:#60706a}.card{background:white;border:1px solid #dce4dc;border-radius:20px;padding:26px;margin:18px 0}.row{display:flex;align-items:center;justify-content:space-between;gap:16px}.account{padding:16px 0;border-bottom:1px solid #edf0eb}.account:last-child{border:0}.muted,small{color:#66776e;font-size:14px}button{border:0;border-radius:10px;padding:12px 18px;background:#17664b;color:white;font:inherit;font-weight:600;cursor:pointer}button.secondary{background:#eef3ec;color:#315445}button:disabled{opacity:.5;cursor:default}input{font:inherit;border:1px solid #ccd7ce;border-radius:10px;padding:12px;width:100%;margin:12px 0}.badge{font-size:12px;background:#eef3ec;padding:6px 10px;border-radius:20px;white-space:nowrap}#message{padding:14px 18px;line-height:1.5;background:#e8eee7;border-radius:12px;position:sticky;top:12px;z-index:1}#message:empty{display:none}#message.error{color:#a3312a}code{background:#eef3ec;padding:5px 9px;border-radius:6px}details{margin-top:16px}li{margin:14px 0;line-height:1.5}.entry{padding:16px 0;border-bottom:1px solid #edf0eb;overflow-wrap:anywhere}.entry p{margin:7px 0}.entries{max-height:440px;overflow:auto}select{font:inherit;padding:8px;border:1px solid #ccd7ce;border-radius:8px;background:white}summary{cursor:pointer}footer{font-size:13px;color:#718078;line-height:1.6;margin:26px 0}a{color:#17664b}@media(max-width:500px){main{margin:28px auto}h1{font-size:32px}.card{padding:20px}.row{flex-wrap:wrap}}
+</style><main><header><div class="eyebrow">CODEX ACCOUNTS</div><h1>Your Codex activity.</h1><p>See which account each chat uses, follow automatic switches, and keep an eye on your limits.</p></header><div id="message" role="status" aria-live="polite"></div>
+<section class="card"><div class="row"><h2>Accounts & usage</h2><button class="secondary" id="refresh">Refresh usage</button></div><div id="accounts"><p>Loading your accounts…</p></div><p class="muted" id="usage-time"></p><details><summary>Add another account</summary><form id="addform"><label for="label">Account label <small>(optional)</small></label><input id="label" maxlength="40" placeholder="e.g. Personal or Work" autocomplete="off"><button id="add">Add account</button></form><p class="muted">Sign in with the account you want to add in the browser that opens.</p></details></section>
+<section class="card"><div class="row"><h2>Chats</h2><span id="chat-count" class="badge">Loading…</span></div><input id="chat-search" type="search" placeholder="Search chats, projects or accounts" aria-label="Search chats"><label><input id="live-only" type="checkbox" style="width:auto;margin-right:8px">Connected only</label><div class="entries" id="chats"></div><p class="muted" id="coverage"></p></section>
+<section class="card"><div class="row"><h2>Activity</h2><select id="event-filter" aria-label="Activity filter"><option value="all">All activity</option><option value="switches">Account switches</option></select></div><p class="muted">Latest 200 recorded events. Times are local to this browser.</p><div class="entries" id="events"></div></section>
+<section class="card"><details><summary><strong>Usage history</strong></summary><p class="muted">Account quota snapshots, sampled every minute while this page is open. Unchanged values are saved every five minutes. Kept for 30 days; latest 100 shown. These are account totals, not per-chat token costs.</p><div class="entries" id="usage-history"></div></details></section>
+<section class="card"><div class="row"><h2>Desktop connection</h2><span id="badge" class="badge">Checking</span></div><p id="explain">We’ll configure and start the local connection for you. It starts automatically when you log in to this Mac.</p><button id="connect" disabled>Connect</button><details id="desktop" hidden><summary>Connection instructions</summary><p>The local connection is ready. Link it in Desktop once:</p><ol><li>Open <strong>Settings → Connections → SSH → Add</strong>.</li><li>Use hostname <code id="alias">codex-auto</code> <button id="copy" class="secondary">Copy</button>. Leave port and identity blank.</li><li>Add a project folder on that connection, then start a chat there.</li></ol><p class="muted">Already linked? You’re ready to use that project. Existing chats stay on their current connection.</p></details></section>
 <footer>Runs privately on this Mac. Account credentials stay on this device.<br>Closing this page leaves your chats and background connection running.</footer></main>
 <script>
 const token=location.hash.slice(1)||sessionStorage.getItem('setup-token')||'';sessionStorage.setItem('setup-token',token);history.replaceState(null,'',location.pathname);let busy=false;
 const $=id=>document.getElementById(id);const say=(s,error=false)=>{$('message').textContent=s;$('message').className=error?'error':''};
 async function api(path,body){const r=await fetch('/api/'+path,{method:body?'POST':'GET',headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(!r.ok)throw Error(r.status===403?'This setup page expired. Run codex-accounts setup to open it again.':'Could not reach setup. Reopen with codex-accounts setup.');return r.json()}
-function render(s){busy=s.job.busy;for(const id of ['add','refresh','connect'])$(id).disabled=busy;const box=$('accounts');box.replaceChildren();for(const a of s.accounts){const d=document.createElement('div');d.className='account';const name=document.createElement('strong');name.textContent=a.label+(a.email?' · '+a.email:'');d.append(name);const p=document.createElement('p');p.className='muted';p.textContent=a.detail;d.append(p);box.append(d)}if(!s.accounts.length){const p=document.createElement('p');p.textContent='Connect your first account to get started.';box.append(p)}$('connect').disabled=busy||!s.accounts.some(a=>a.connected);$('connect').hidden=s.ready;$('desktop').hidden=!s.ready;$('alias').textContent=s.alias;$('badge').textContent=s.ready?'Local connection ready':'Not connected';$('explain').hidden=s.ready;if(s.job.message)say(s.job.message,s.job.error)}
+function render(s){busy=s.job.busy;for(const id of ['add','refresh','connect'])$(id).disabled=busy;const box=$('accounts');box.replaceChildren();for(const a of s.accounts){const d=document.createElement('div');d.className='account';const name=document.createElement('strong');name.textContent=a.label+(a.email?' · '+a.email:'');d.append(name);const p=document.createElement('p');p.className='muted';p.textContent=a.detail;d.append(p);box.append(d)}if(!s.accounts.length){const p=document.createElement('p');p.textContent='Connect your first account to get started.';box.append(p)}$('connect').disabled=busy||!s.accounts.some(a=>a.connected);$('connect').hidden=s.ready;$('desktop').hidden=!s.ready;$('alias').textContent=s.alias;$('badge').textContent=s.ready?'Local connection ready':'Not connected';$('explain').hidden=s.ready;$('usage-time').textContent=s.usage_checked_at?'Checked '+new Date(s.usage_checked_at*1000).toLocaleTimeString()+' · refreshes every minute':'';if(s.job.message)say(s.job.message,s.job.error)}
 async function poll(){try{render(await api('state'))}catch(e){say(e.message,true)}}
 async function action(name,extra={}){if(busy)return;busy=true;for(const id of ['add','refresh','connect'])$(id).disabled=true;try{const s=await api('action',{action:name,...extra});render(s)}catch(e){busy=false;say(e.message,true)}}
 $('addform').onsubmit=e=>{e.preventDefault();action('add',{label:$('label').value.trim()})};$('refresh').onclick=()=>action('refresh');$('connect').onclick=()=>action('connect');$('copy').onclick=async()=>{try{await navigator.clipboard.writeText($('alias').textContent);$('copy').textContent='Copied'}catch(e){say('Hostname: '+$('alias').textContent)}};
+
+let activity={chats:[],events:[],usage_history:[]};
+const when=t=>t?new Date(t*1000).toLocaleString():'';
+function entry(parent,title,detail,extra){const d=document.createElement('div');d.className='entry';const h=document.createElement('strong');h.textContent=title;d.append(h);for(const text of [detail,extra]){if(!text)continue;const p=document.createElement('p');p.className='muted';p.textContent=text;d.append(p)}parent.append(d)}
+function renderActivity(){const q=$('chat-search').value.toLowerCase();const live=$('live-only').checked;const chats=activity.chats.filter(c=>(!live||c.live)&&[c.title,c.project,c.account,c.id].join(' ').toLowerCase().includes(q));$('chat-count').textContent=activity.chats.filter(c=>c.live).length+' connected · '+chats.length+' shown';$('chats').replaceChildren();for(const c of chats)entry($('chats'),c.title,c.assignment+': '+c.account+' · '+c.state+(c.model?' · '+c.model:''),c.project+' · '+when(c.updated)+' · '+c.id);if(!chats.length)entry($('chats'),'No matching chats','Chats appear here once used through the launcher or its Desktop connection.');$('coverage').textContent='Local Desktop chats outside this connection are not monitored.'+(activity.unassigned?' '+activity.unassigned+' terminal launch(es) have no recorded chat ID.':'');
+const names={auto_opened:'Chat connected',manual_opened:'Chat opened',turn_started:'Turn started',auto_switched:'Automatically switched',moved:'Account changed',imported:'Chat imported',usageLimitExceeded:'Usage limit reached',rateLimitExceeded:'Rate limit reached'};const events=activity.events.filter(e=>$('event-filter').value!=='switches'||['auto_switched','moved'].includes(e.event));$('events').replaceChildren();for(const e of events)entry($('events'),(names[e.event]||e.event)+' · '+(e.previous_account?e.previous_account+' → ':'')+e.account,when(e.timestamp)+' · '+(e.title||e.session||'Unassigned terminal chat'),e.session||'');if(!events.length)entry($('events'),'No recorded events'+($('event-filter').value==='switches'?' for account switches':''),'Only observed events are shown; older activity is not reconstructed.');$('usage-history').replaceChildren();for(const h of activity.usage_history)entry($('usage-history'),h.account+' · '+when(h.timestamp),h.detail);if(!activity.usage_history.length)entry($('usage-history'),'No usage samples yet','The first refresh starts the history.');}
+async function pollActivity(){try{activity=await api('activity');renderActivity()}catch(e){$('coverage').textContent='Activity unavailable. Retrying shortly.'}}
+$('chat-search').oninput=renderActivity;$('live-only').onchange=renderActivity;$('event-filter').onchange=renderActivity;
+pollActivity();setInterval(pollActivity,10000);
+
 poll();setInterval(poll,2500);
 </script></html>'''
+
+
+def save_usage_observations(reports):
+    """Persist quota samples, never credentials or inferred per-chat billing."""
+    with contextlib.closing(sqlite3.connect(ROOT/'usage.sqlite',timeout=5)) as db:
+        db.execute('CREATE TABLE IF NOT EXISTS samples (timestamp REAL, account TEXT, detail TEXT, availability TEXT)')
+        for r in reports:
+            detail=re.sub(r'\[[#-]+\] ', '', ' · '.join(line for line in usage_lines(r.get('usage')) if '% left' in line)) or 'Limits unavailable'
+            last=db.execute('SELECT timestamp,detail,availability FROM samples WHERE account=? ORDER BY timestamp DESC LIMIT 1',(r['label'],)).fetchone()
+            stamp=r.get('checked_at') or time.time();state=quota_state(r)
+            if not last or last[1:]!=(detail,state) or stamp-last[0]>=300:
+                db.execute('INSERT INTO samples VALUES (?,?,?,?)',(stamp,r['label'],detail,state))
+        db.execute('DELETE FROM samples WHERE timestamp < ?',(time.time()-30*86400,))
+        db.commit()
+
+
+def dashboard_activity():
+    overview=conversation_overview()
+    # PID existence alone can mistake a reused PID for a connected chat.
+    process_list=subprocess.run(['ps','-axo','pid=,command='],capture_output=True,text=True,timeout=5)
+    launcher_pids=set()
+    if process_list.returncode==0:
+        for line in process_list.stdout.splitlines():
+            parts=line.strip().split(None,1)
+            if len(parts)==2 and re.search(r'(?:^|/)codex-accounts (?:serve|auto|continue|run|resume)(?: |$)',parts[1]):
+                launcher_pids.add(int(parts[0]))
+    chats=[]
+    for row in overview['conversations']:
+        runs=[r for r in row['running'] if r.get('pid') in launcher_pids]
+        chats.append(dict(id=row['id'],title=row['title'],project=row['cwd'],updated=row['modified'],
+                          live=bool(runs),account=', '.join(sorted({r['account'] for r in runs})) or row['stored_account'] or ', '.join(row['observed_accounts']) or 'Unknown',
+                          assignment='Current account' if runs else ('Stored under' if row['stored_account'] else 'Last observed account'),
+                          state=', '.join(sorted({r.get('phase') or 'Connected' for r in runs})) or 'Not connected',
+                          model=', '.join(sorted({r['model'] for r in runs if r.get('model')}))))
+    events=[{k:e.get(k) for k in ('timestamp','session','account','event','title','previous_account')} for e in activity_records()[-200:]][::-1]
+    samples=[];path=ROOT/'usage.sqlite'
+    if path.exists():
+        with contextlib.closing(sqlite3.connect(path.as_uri()+'?mode=ro',uri=True)) as db:
+            db.row_factory=sqlite3.Row
+            samples=[dict(r) for r in db.execute('SELECT * FROM samples ORDER BY timestamp DESC LIMIT 100')]
+    return dict(chats=chats,events=events,usage_history=samples,checked_at=time.time(),
+                unassigned=len(overview['unassigned_launches']),local_unknown=overview['local_unknown_count'])
 
 class SetupWindow:
     def __init__(self, account=None, port=None):
@@ -2439,6 +2494,11 @@ class SetupWindow:
         self.mutex=threading.Lock()
         self.job=dict(busy=False,message='',error=False)
         self.reports=[]
+        self.activity_cache={}
+        self.activity_at=0
+        self.activity_mutex=threading.Lock()
+        self.last_usage_refresh=0
+        self.last_usage_attempt=0
         self.last_seen=time.monotonic()
 
     def snapshot(self):
@@ -2462,13 +2522,26 @@ class SetupWindow:
             detail=re.sub(r'\[[#-]+\] ', '', ' · '.join(line for line in usage_lines(r['usage']) if '% left' in line)) if r.get('usage') else ('Usage not checked' if connected else 'Sign-in not complete — add this label again to retry')
             if not detail:detail='Usage unavailable — refresh to check again'
             rows.append(dict(label=name,email=identity[0] if identity[0]!='—' else '',connected=connected,detail=detail))
-        return dict(accounts=rows,ready=ready,alias=settings.get('alias','codex-auto'),job=job)
+        return dict(accounts=rows,ready=ready,alias=settings.get('alias','codex-auto'),job=job,usage_checked_at=self.last_usage_refresh)
+
+    def activity(self):
+        with self.activity_mutex:
+            if not self.activity_cache or time.monotonic()-self.activity_at>10:
+                self.activity_cache=dashboard_activity();self.activity_at=time.monotonic()
+            return self.activity_cache
+
+    def set_reports(self,reports):
+        save_usage_observations(reports)
+        with self.mutex:
+            self.reports=reports;self.last_usage_refresh=time.time()
+        self.activity_at=0
 
     def start(self, action, label=''):
         if action not in ('connect','add','refresh'):raise Error('Unknown setup action')
         if not isinstance(label,str) or (label and not NAME.fullmatch(label)):raise Error('Use letters, numbers, hyphens or underscores for the account label.')
         with self.mutex:
             if self.job['busy']:raise Error('An operation is already running.')
+            if action=='refresh':self.last_usage_attempt=time.time()
             self.job=dict(busy=True,error=False,message={'connect':'Configuring and checking your local connection…','add':'Complete sign-in in the browser. This may take a few minutes.','refresh':'Checking account usage…'}[action])
         threading.Thread(target=self.work,args=(action,label),daemon=True).start()
 
@@ -2478,7 +2551,7 @@ class SetupWindow:
             with lock('setup-window-job'):
                 if action=='refresh':
                     reports=collect_status()
-                    with self.mutex:self.reports=reports
+                    self.set_reports(reports)
                     message='Usage updated.'
                 else:
                     args=[sys.executable,str(executable_path())]
@@ -2503,8 +2576,8 @@ class SetupWindow:
                     if code:raise Error('Sign-in did not finish. Try Add account again with the same label.' if action=='add' else 'Connection setup could not finish. Run codex-accounts setup --terminal for the detailed error. Running chats were not restarted.')
                     message='Account added. Connect when you’re ready.' if action=='add' else 'Local connection ready. Finish the one-time link in Codex Desktop.'
                     reports=collect_status()
-                    with self.mutex:self.reports=reports
-        except (Error,OSError,ValueError,subprocess.SubprocessError) as exc:
+                    self.set_reports(reports)
+        except (Error,OSError,ValueError,sqlite3.Error,subprocess.SubprocessError) as exc:
             message=str(exc);failed=True
         finally:
             with self.mutex:self.job=dict(busy=False,error=failed,message=message)
@@ -2535,6 +2608,10 @@ def setup_http_server(window):
         def do_GET(self):
             if not self.allowed(auth=self.path!='/'):return self.reply(403,{})
             if self.path=='/':return self.reply(200,SETUP_HTML,True)
+            if self.path=='/api/activity':
+                window.last_seen=time.monotonic()
+                try:return self.reply(200,window.activity())
+                except (Error,OSError,ValueError,sqlite3.Error,subprocess.SubprocessError):return self.reply(503,{'error':'Activity could not be read. Retrying shortly.'})
             if self.path=='/api/state':
                 window.last_seen=time.monotonic()
                 return self.reply(200,window.snapshot())
@@ -2568,6 +2645,8 @@ def serve_setup_window(account=None,port=None):
     try:
         while time.monotonic()-window.last_seen<1800 or window.job['busy']:
             server.handle_request()
+            if not window.job['busy'] and time.time()-window.last_usage_attempt>=60:
+                window.start('refresh')
     finally:server.server_close()
     return 0
 

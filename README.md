@@ -18,7 +18,9 @@ This opens a private setup page in your browser:
 2. **Connect** configures and checks the local SSH connection and background services.
 3. Follow the short **Finish in Codex Desktop** card once to link the connection and add a project on it.
 
-The page shows connected account identities, usage, progress, and local connection readiness. It never claims Desktop is linked just because the local services are ready. Codex Desktop still requires its own connection/project selection; there is no supported automatic approval API. Existing chats stay on their current connection.
+The page shows account usage, searchable chats with their account and observed state, and an activity feed with automatic switches. Activity refreshes every 10 seconds; quota refreshes every minute while the page is open. Usage snapshots are retained locally for 30 days (latest 100 displayed), and the feed displays the latest 200 recorded events. Quota snapshots are account totals, not per-chat billing. Chats outside the launcher/managed Desktop connection are not monitored. PID reuse is excluded from connected-chat indicators.
+
+The page also shows setup progress and local connection readiness. It never claims Desktop is linked just because the local services are ready. Codex Desktop still requires its own connection/project selection; there is no supported automatic approval API. Existing chats stay on their current connection.
 
 Setup creates a dedicated localhost SSH key and alias and installs two user LaunchAgents. They start when you log in and restart after a crash. Re-running setup preserves accounts, histories, permissions, keys, and running services. No admin password, macOS Remote Login, external server, or Python packages are needed. Closing the page does not stop your chats. Its local web server exits after 30 minutes without page activity.
 
